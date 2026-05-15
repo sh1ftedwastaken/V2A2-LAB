@@ -1,0 +1,17 @@
+{
+  "cSpell.words": [
+    "autocast",
+    "cudnn",
+    "ious",
+    "jaccard",
+    "Jaccard",
+    "lightunet",
+    "logcosh",
+    "lovasz",
+    "Lovasz",
+    "miou",
+    "overfit",
+    "preds",
+    "unet"
+  ]
+}

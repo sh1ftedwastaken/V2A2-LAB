@@ -1,0 +1,19 @@
+{
+  "cSpell.words": [
+    "autocast",
+    "cudnn",
+    "imagenet",
+    "ious",
+    "jaccard",
+    "Jaccard",
+    "lightunet",
+    "logcosh",
+    "lovasz",
+    "Lovasz",
+    "miou",
+    "overfit",
+    "preds",
+    "unet"
+  ],
+  "cmake.ignoreCMakeListsMissing": true
+}
