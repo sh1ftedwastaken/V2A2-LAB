@@ -3,14 +3,11 @@
 
 import cv2
 import numpy as np
-
 import rclpy
 from rclpy.node import Node
-
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
-
 
 # ============================================================
 # CLASS IDS
@@ -30,9 +27,9 @@ CLASS_VEHICLE = 4
 class LaneEstimator:
 
     def __init__(self):
-        self.prev_width = 80
+        self.prev_width = None
 
-    def extract_lane(self, mask, target_lane="RIGHT"):
+    def extract_lane(self, mask):
 
         h, w = mask.shape
 
@@ -48,32 +45,29 @@ class LaneEstimator:
         if len(xs_y) < 15 and len(xs_w) < 15:
             return None, None
 
-        y_median = np.median(xs_y) if len(xs_y) > 15 else None
-        w_median = np.median(xs_w) if len(xs_w) > 15 else None
+        # ----------------------------------------------------
+        # CASE 1: both boundaries exist
+        # ----------------------------------------------------
+        if len(xs_y) > 15 and len(xs_w) > 15:
+
+            left_x  = np.median(xs_y)
+            right_x = np.median(xs_w)
 
         # ----------------------------------------------------
-        # LANE SELECTION LOGIC
+        # CASE 2: only yellow
         # ----------------------------------------------------
-        if target_lane == "RIGHT":
-            # Target is between Yellow (Divider) and right-side White (Shoulder)
-            if y_median is not None:
-                left_x = y_median
-                valid_white = xs_w[xs_w > y_median]
-                right_x = np.median(valid_white) if len(valid_white) > 15 else left_x + 80
-            else:
-                # Fallback: Just follow white line as right edge
-                right_x = w_median
-                left_x = right_x - 80
+        elif len(xs_y) > 15:
+
+            left_x = np.median(xs_y)
+            right_x = left_x + 240   # assumed lane width fallback
+
+        # ----------------------------------------------------
+        # CASE 3: only white
+        # ----------------------------------------------------
         else:
-            # Target is between left-side White (Shoulder) and Yellow (Divider)
-            if y_median is not None:
-                right_x = y_median
-                valid_white = xs_w[xs_w < y_median]
-                left_x = np.median(valid_white) if len(valid_white) > 15 else right_x - 80
-            else:
-                # Fallback: Just follow white line as left edge
-                left_x = w_median
-                right_x = left_x + 80
+
+            right_x = np.median(xs_w)
+            left_x = right_x - 240
 
         lane_width = right_x - left_x
 
@@ -81,7 +75,7 @@ class LaneEstimator:
         # lane width stabilization (CRITICAL FIX)
         # ----------------------------------------------------
         if self.prev_width is not None:
-            if abs(lane_width - self.prev_width) > 40:
+            if abs(lane_width - self.prev_width) > 90:
                 lane_width = self.prev_width
 
         self.prev_width = lane_width
@@ -97,9 +91,10 @@ class LaneEstimator:
 
 class Controller:
 
-    def __init__(self):
-        self.kp = 0.0105
-        self.kd = 0.0045
+    def __init__(self, kp=0.0105, kd=0.0045, max_angular=0.38):
+        self.kp = kp
+        self.kd = kd
+        self.max_angular = max_angular
         self.prev_error = 0.0
 
     def compute(self, error, lane_width):
@@ -113,29 +108,7 @@ class Controller:
         if lane_width is not None and lane_width < 200:
             omega *= 1.15
 
-        return float(np.clip(omega, -0.38, 0.38))
-
-
-# ============================================================
-# OBSTACLE DETECTOR (ACC / SAFETY)
-# ============================================================
-
-class ObstacleDetector:
-
-    def __init__(self):
-        self.stop_threshold = 40
-        self.slow_threshold = 80
-
-    def detect_obstacle(self, mask):
-        h, w = mask.shape
-        # Trigger Overtake ROI: Moved further ahead (0.45-0.75 instead of 0.70-0.90)
-        stop_roi = mask[int(h*0.45):int(h*0.75), int(w*0.30):int(w*0.70)]
-        # Early Warning ROI: Even further ahead
-        slow_roi = mask[int(h*0.20):int(h*0.45), int(w*0.25):int(w*0.75)]
-
-        if np.sum(stop_roi == CLASS_VEHICLE) > self.stop_threshold: return "STOP"
-        if np.sum(slow_roi == CLASS_VEHICLE) > self.slow_threshold: return "SLOW"
-        return "CLEAR"
+        return float(np.clip(omega, -self.max_angular, self.max_angular))
 
 
 # ============================================================
@@ -148,18 +121,29 @@ class AutonomousDrivingNode(Node):
 
         super().__init__("autonomous_driving")
 
+        # Declare parameters to maintain compatibility with existing launch commands
+        self.declare_parameter("kp", 0.0105)
+        self.declare_parameter("kd", 0.0045)
+        self.declare_parameter("target_speed", 0.16)
+        self.declare_parameter("max_angular", 0.38)
+        self.declare_parameter("lane_position", 0.5)
+        self.declare_parameter("bev_mask_topic", "/seg/bev_mask")
+
+        kp = self.get_parameter("kp").value
+        kd = self.get_parameter("kd").value
+        self.target_speed = self.get_parameter("target_speed").value
+        max_angular = self.get_parameter("max_angular").value
+        self.lane_position = self.get_parameter("lane_position").value
+        bev_mask_topic = self.get_parameter("bev_mask_topic").value
+
         self.bridge = CvBridge()
 
         self.estimator = LaneEstimator()
-        self.controller = Controller()
-        self.obstacle_detector = ObstacleDetector()
-        
-        self.current_lane = "RIGHT"
-        self.switch_cooldown = 0
+        self.controller = Controller(kp=kp, kd=kd, max_angular=max_angular)
 
         self.sub = self.create_subscription(
             Image,
-            "/seg/bev_mask",
+            bev_mask_topic,
             self.callback,
             1
         )
@@ -182,32 +166,10 @@ class AutonomousDrivingNode(Node):
 
         debug[mask == CLASS_WHITE]  = (255, 255, 255)
         debug[mask == CLASS_YELLOW] = (0, 255, 255)
-        debug[mask == CLASS_VEHICLE] = (0, 0, 255)
+
+        lane_center, lane_width = self.estimator.extract_lane(mask)
 
         cmd = Twist()
-
-        # ====================================================
-        # OBSTACLE HANDLING
-        # ====================================================
-        obs_state = self.obstacle_detector.detect_obstacle(mask)
-        speed_multiplier = 1.0
-
-        if self.switch_cooldown > 0:
-            self.switch_cooldown -= 1
-            cv2.putText(debug, f"OVERTAKING...", (10, 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-        elif obs_state == "STOP":
-            # TRIGGER OVERTAKE
-            old_lane = self.current_lane
-            self.current_lane = "LEFT" if self.current_lane == "RIGHT" else "RIGHT"
-            self.switch_cooldown = 80  # Increased cooldown to ensure full lane clearance
-            self.controller.prev_error = 0.0 # Reset PID to prevent snap
-            self.get_logger().warn(f"OBSTACLE! Switching {old_lane} -> {self.current_lane}")
-
-        elif obs_state == "SLOW":
-            speed_multiplier = 0.5
-
-        lane_center, lane_width = self.estimator.extract_lane(mask, target_lane=self.current_lane)
 
         # ====================================================
         # FAILSAFE MODE
@@ -225,15 +187,17 @@ class AutonomousDrivingNode(Node):
         # STEERING
         # ====================================================
 
-        robot_center = w / 2
-        error = robot_center - lane_center
+        # robot_center is the point we want to align with the lane. 
+        robot_center = w / 2.0
+        target_x = lane_center + (self.lane_position - 0.5) * lane_width
+        error = robot_center - target_x
 
         omega = self.controller.compute(error, lane_width)
 
         # speed scaling (curve-safe)
         turn = min(abs(omega), 0.5)
-        speed = 0.16 - turn * 0.12
-        speed = max(speed, 0.07) * speed_multiplier
+        speed = self.target_speed - turn * 0.12
+        speed = max(speed, 0.07)
 
         cmd.linear.x = float(speed)
         cmd.angular.z = float(omega)
@@ -241,9 +205,6 @@ class AutonomousDrivingNode(Node):
         # ====================================================
         # DEBUG VISUALIZATION
         # ====================================================
-        
-        cv2.putText(debug, f"LANE: {self.current_lane}", (10, 60), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         cv2.circle(debug,
                    (int(lane_center), int(h * 0.80)),

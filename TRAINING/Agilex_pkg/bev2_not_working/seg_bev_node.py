@@ -61,6 +61,13 @@ class SegBEVNode(Node):
 
         with open(params_path, "r", encoding="utf-8") as handle:
             cam = yaml.safe_load(handle)
+            
+        if not isinstance(cam, dict):
+            self.get_logger().error(
+                f"Failed to parse '{params_path}' as a dictionary. "
+                f"Parsed type: {type(cam).__name__}. Ensure the file is valid YAML/JSON "
+                "and that colons are followed by a space (e.g., 'k: [...]' not 'k:[...]').")
+            raise TypeError(f"Camera parameters at {params_path} must be a YAML dictionary.")
 
         k_native = np.array(cam["k"]).reshape(3, 3)
         self.d = np.array(cam["d"])
@@ -148,4 +155,3 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
-

@@ -1,7 +1,0 @@
-# Source points for seg_bev_node.py.
-# Format: near-left, near-right, far-right, far-left.
-# Coordinates are in the 160x120 /seg/mask_raw image.
-10 119
-150 119
-110 65
-50 65
