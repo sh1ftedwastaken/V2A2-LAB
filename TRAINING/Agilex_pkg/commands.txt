@@ -47,7 +47,9 @@ python3 /home/agilex/limo_code_StutiRuparel/bev2/debug_visualizer.py
 
 TERMINAL 7:
 source ~/limo_code_StutiRuparel/install/setup.bash
-python3 /home/agilex/limo_code_StutiRuparel/bev2/autonomous_driving.py
+python3 /home/agilex/limo_code_StutiRuparel/bev2/autonomous_driving.py \
+--ros-args \
+-p center_offset_px:=10
 
 
 

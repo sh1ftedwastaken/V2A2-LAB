@@ -52,7 +52,7 @@ class EdgeLaneTracker:
     def calculate_target_center(self, mask):
 
         h, w = mask.shape
-        car_center = (w / 2.0) + self.center_offset_px * 0.6
+        car_center = (w / 2.0)
         half_lane = self.running_lane_width / 2.0
 
         roi = mask[int(h * 0.70):int(h * 0.94), :]
@@ -193,7 +193,7 @@ class Driver(Node):
             self.pub.publish(cmd)
             return
 
-        desired_center = (w / 2.0) + self.center_offset_px if state != STATE_BOTH else (w / 2.0)
+        desired_center = (w / 2.0)
         raw_error = desired_center - center
         smoothed_error = self.error_filter.filter(raw_error)
         omega = self.ctrl.compute(smoothed_error)
