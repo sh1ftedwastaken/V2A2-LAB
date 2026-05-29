@@ -30,12 +30,13 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from bev.bev_transform import undistort_mask, to_bev, cleanup_bev, scale_intrinsics
-from autonomous_driving import CLASS_ROAD, CLASS_WHITE, CLASS_YELLOW, DEFAULT_CENTER_OFFSET_PX, DEFAULT_LANE_WIDTH, STATE_LOST, EdgeLaneTracker
 
 
 CLASS_BG = 0
+CLASS_ROAD = 1
+CLASS_WHITE = 2
+CLASS_YELLOW = 3
 CLASS_VEHICLE = 4
 
 CLASS_COLORS = {
@@ -52,6 +53,89 @@ DEBUG_CENTER = (255, 0, 0)
 DEBUG_ROBOT_CENTER = (0, 255, 0)
 DEBUG_ROI = (180, 180, 180)
 
+STATE_BOTH = "BOTH_LANES"
+STATE_LEFT_ONLY = "LEFT_LANE_ONLY"
+STATE_RIGHT_ONLY = "RIGHT_LANE_ONLY"
+STATE_DRIVABLE = "DRIVABLE_AREA_MODE"
+STATE_LOST = "LOST"
+
+
+class DrivingLaneDebug:
+
+    def __init__(self, default_lane_width=100.0):
+        self.running_lane_width = float(default_lane_width)
+        self.alpha_width = 0.05
+
+    def lane_measurement(self, roi: np.ndarray, cls: int):
+        _, xs = np.where(roi == cls)
+        if len(xs) < 12:
+            return None, 0
+        return float(np.median(xs)), len(xs)
+
+    def update_lane_width(self, yellow_x, white_x):
+        measured_width = abs(white_x - yellow_x)
+        self.running_lane_width = (
+            self.alpha_width * measured_width
+            + (1.0 - self.alpha_width) * self.running_lane_width
+        )
+
+    def calculate_target_center(self, mask: np.ndarray):
+        h, w = mask.shape
+        car_center = w / 2.0
+        half_lane = self.running_lane_width / 2.0
+
+        roi = mask[int(h * 0.70):int(h * 0.94), :]
+
+        yellow_x, yellow_count = self.lane_measurement(roi, CLASS_YELLOW)
+        white_x, white_count = self.lane_measurement(roi, CLASS_WHITE)
+
+        if yellow_x is None and white_x is None:
+            return None, STATE_LOST
+
+        if yellow_x is not None and white_x is not None:
+            if abs(white_x - yellow_x) >= 35:
+                self.update_lane_width(yellow_x, white_x)
+                return (yellow_x + white_x) / 2.0, STATE_BOTH
+
+            if yellow_count >= white_count:
+                white_x = None
+            else:
+                yellow_x = None
+
+        if yellow_x is not None:
+            if yellow_x < car_center:
+                return yellow_x + half_lane, STATE_LEFT_ONLY
+            return yellow_x - half_lane, STATE_RIGHT_ONLY
+
+        if white_x is not None:
+            if white_x > car_center:
+                return white_x - half_lane, STATE_RIGHT_ONLY
+            return white_x + half_lane, STATE_LEFT_ONLY
+
+        return None, STATE_LOST
+
+    def fallback_drivable_area(self, mask: np.ndarray):
+        h, _ = mask.shape
+        roi = mask[int(h * 0.70):int(h * 0.94), :]
+
+        _, xs = np.where(roi == CLASS_ROAD)
+
+        if len(xs) > 50:
+            return float(np.median(xs))
+
+        return None
+
+    def update(self, mask: np.ndarray):
+        center, state = self.calculate_target_center(mask)
+
+        if state == STATE_LOST:
+            center = self.fallback_drivable_area(mask)
+            if center is not None:
+                state = STATE_DRIVABLE
+
+        return center, state
+
+
 class SegBEVNode(Node):
 
     def __init__(self):
@@ -62,20 +146,7 @@ class SegBEVNode(Node):
         self.declare_parameter("bev_size", 160)
         self.declare_parameter("mask_width", 160)
         self.declare_parameter("mask_height", 120)
-        self.declare_parameter("default_lane_width", DEFAULT_LANE_WIDTH)
-        self.declare_parameter("center_offset_px", DEFAULT_CENTER_OFFSET_PX)
-        
-        self.declare_parameter("bev_src_bottom_left_x", 8.0)
-        self.declare_parameter("bev_src_bottom_left_y", 118.0)
-        self.declare_parameter("bev_src_bottom_right_x", 152.0)
-        self.declare_parameter("bev_src_bottom_right_y", 118.0)
-        self.declare_parameter("bev_src_top_right_x", 120.0)
-        self.declare_parameter("bev_src_top_right_y", 80.0)
-        self.declare_parameter("bev_src_top_left_x", 30.0)
-        self.declare_parameter("bev_src_top_left_y", 80.0)
-        self.declare_parameter("bev_dst_margin_x", 20.0)
-        self.declare_parameter("bev_dst_top_y", 5.0)
-        self.declare_parameter("bev_dst_bottom_y", 155.0)
+        self.declare_parameter("default_lane_width", 100.0)
 
         mask_topic = self.get_parameter("mask_topic").value
         params_path = self.get_parameter("camera_params").value
@@ -83,7 +154,6 @@ class SegBEVNode(Node):
         self.mask_w = self.get_parameter("mask_width").value
         self.mask_h = self.get_parameter("mask_height").value
         default_lane_width = self.get_parameter("default_lane_width").value
-        center_offset_px = self.get_parameter("center_offset_px").value
 
         with open(params_path, "r", encoding="utf-8") as handle:
             cam = yaml.safe_load(handle)
@@ -99,33 +169,22 @@ class SegBEVNode(Node):
         )
 
         src_points = np.float32([
-            [self.get_parameter("bev_src_bottom_left_x").value,
-             self.get_parameter("bev_src_bottom_left_y").value],
-            [self.get_parameter("bev_src_bottom_right_x").value,
-             self.get_parameter("bev_src_bottom_right_y").value],
-            [self.get_parameter("bev_src_top_right_x").value,
-             self.get_parameter("bev_src_top_right_y").value],
-            [self.get_parameter("bev_src_top_left_x").value,
-             self.get_parameter("bev_src_top_left_y").value],
+            [8, 118],
+            [152, 118],
+            [90, 80],
+            [45, 80],
         ])
-        dst_margin_x = self.get_parameter("bev_dst_margin_x").value
-        dst_top_y = self.get_parameter("bev_dst_top_y").value
-        dst_bottom_y = self.get_parameter("bev_dst_bottom_y").value
         dst_points = np.float32([
-            [dst_margin_x, dst_bottom_y],
-            [self.bev_size - dst_margin_x, dst_bottom_y],
-            [self.bev_size - dst_margin_x, dst_top_y],
-            [dst_margin_x, dst_top_y],
+            [20, 155],
+            [140, 155],
+            [140, 5],
+            [20, 5],
         ])
         self.h_matrix, _ = cv2.findHomography(src_points, dst_points)
 
         self.bridge = CvBridge()
-        self.lane_debug = EdgeLaneTracker(
-            default_lane_width=default_lane_width,
-            center_offset_px=center_offset_px,
-        )
+        self.lane_debug = DrivingLaneDebug(default_lane_width=default_lane_width)
         self._frames = 0
-        
         self.sub = self.create_subscription(Image, mask_topic, self.image_callback, 10)
         self.pub_bev_mask = self.create_publisher(Image, "/seg/bev_mask", 10)
         self.pub_bev = self.create_publisher(Image, "/seg/bev", 10)
@@ -134,8 +193,6 @@ class SegBEVNode(Node):
         self.get_logger().info(f"Subscribed to mask topic: {mask_topic}")
         self.get_logger().info(f"Expected mask size     : {self.mask_w}x{self.mask_h}")
         self.get_logger().info(f"BEV size               : {self.bev_size}x{self.bev_size}")
-        self.get_logger().info(f"BEV source points      : {src_points.tolist()}")
-        self.get_logger().info(f"BEV destination points : {dst_points.tolist()}")
         self.get_logger().info("seg_bev_node ready - waiting for masks")
 
     def colorize(self, mask: np.ndarray) -> np.ndarray:
@@ -146,8 +203,9 @@ class SegBEVNode(Node):
 
     def driving_overlay(self, mask: np.ndarray) -> np.ndarray:
         overlay = self.colorize(mask)
-        _, w = mask.shape
-        y0, y1 = self.lane_debug.roi_bounds(mask)
+        h, w = mask.shape
+        y0 = int(h * 0.70)
+        y1 = int(h * 0.94)
 
         roi_mask = mask[y0:y1, :]
         roi_overlay = overlay[y0:y1, :]
@@ -156,7 +214,7 @@ class SegBEVNode(Node):
 
         cv2.rectangle(overlay, (0, y0), (w - 1, y1 - 1), DEBUG_ROI, 1)
 
-        center, state, _ = self.lane_debug.update(mask)
+        center, state = self.lane_debug.update(mask)
         robot_center = w / 2
 
         cv2.line(
@@ -200,7 +258,7 @@ class SegBEVNode(Node):
         bev_mask = to_bev(
             mask_undist,
             self.h_matrix,
-            bev_size=(self.bev_size, self.bev_size)
+            bev_size=(self.bev_size, self.bev_size),
         )
         bev_clean = cleanup_bev(bev_mask)
 
@@ -222,10 +280,6 @@ class SegBEVNode(Node):
         if self._frames == 1:
             self.get_logger().info(
                 f"First mask received - classes in frame: {np.unique(mask).tolist()}"
-            )
-        elif self._frames % 100 == 0:
-            self.get_logger().info(
-                f"Frames processed: {self._frames} - classes in latest frame: {np.unique(mask).tolist()}"
             )
 
 
