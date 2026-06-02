@@ -21,19 +21,35 @@ STATE_RIGHT_ONLY = "RIGHT_LANE_ONLY"
 STATE_DRIVABLE = "DRIVABLE_AREA_MODE"
 STATE_LOST = "LOST"
 
+DEFAULT_LANE_WIDTH = 100.0
+DEFAULT_MAX_SPEED = 0.20
+DEFAULT_CENTER_OFFSET_PX = 17.0
+DEFAULT_ROI_START_RATIO = 0.60
+DEFAULT_ROI_END_RATIO = 0.84
 
 # =========================================================
 # LANE TRACKER
 # =========================================================
 class EdgeLaneTracker:
 
-    def __init__(self, default_lane_width=100.0, center_offset_px=0.0):
+    def __init__(
+        self,
+        default_lane_width=DEFAULT_LANE_WIDTH,
+        center_offset_px=DEFAULT_CENTER_OFFSET_PX,
+        roi_start_ratio=DEFAULT_ROI_START_RATIO,
+        roi_end_ratio=DEFAULT_ROI_END_RATIO,
+    ):
         self.running_lane_width = float(default_lane_width)
         self.center_offset_px = float(center_offset_px)
+        self.roi_start_ratio = float(roi_start_ratio)
+        self.roi_end_ratio = float(roi_end_ratio)
         self.alpha_width = 0.05
 
-    def lane_measurement(self, roi, cls):
+    def roi_bounds(self, mask):
+        h, _ = mask.shape
+        return int(h * self.roi_start_ratio), int(h * self.roi_end_ratio)
 
+    def lane_measurement(self, roi, cls):
         _, xs = np.where(roi == cls)
 
         if len(xs) < 12:
@@ -42,7 +58,6 @@ class EdgeLaneTracker:
         return float(np.median(xs)), len(xs)
 
     def update_lane_width(self, yellow_x, white_x):
-
         measured_width = abs(white_x - yellow_x)
         self.running_lane_width = (
             self.alpha_width * measured_width
@@ -50,12 +65,12 @@ class EdgeLaneTracker:
         )
 
     def calculate_target_center(self, mask):
-
-        h, w = mask.shape
+        _, w = mask.shape
         car_center = (w / 2.0)
         half_lane = self.running_lane_width / 2.0
 
-        roi = mask[int(h * 0.70):int(h * 0.94), :]
+        y0, y1 = self.roi_bounds(mask)
+        roi = mask[y0:y1, :]
 
         yellow_x, yellow_count = self.lane_measurement(roi, CLASS_YELLOW)
         white_x, white_count = self.lane_measurement(roi, CLASS_WHITE)
@@ -86,9 +101,8 @@ class EdgeLaneTracker:
         return None, STATE_LOST
 
     def fallback_drivable_area(self, mask):
-
-        h, _ = mask.shape
-        roi = mask[int(h * 0.70):int(h * 0.94), :]
+        y0, y1 = self.roi_bounds(mask)
+        roi = mask[y0:y1, :]
 
         _, xs = np.where(roi == CLASS_ROAD)
 
@@ -96,6 +110,19 @@ class EdgeLaneTracker:
             return float(np.median(xs))
 
         return None
+
+    def update(self, mask):
+        center, state = self.calculate_target_center(mask)
+        multiplier = 1.0
+
+        if state == STATE_LOST:
+            center = self.fallback_drivable_area(mask)
+            if center is not None:
+                state = STATE_DRIVABLE
+        elif state == STATE_RIGHT_ONLY:
+            multiplier = -1.0
+            
+        return center, state, multiplier
 
 
 # =========================================================
@@ -138,7 +165,7 @@ class Controller:
         self.prev = error
 
         omega = self.kp * error + self.kd * d
-        return float(np.clip(omega, -0.38, 0.38))
+        return float(np.clip(omega, -0.45, 0.45))
 
 
 # =========================================================
@@ -150,9 +177,9 @@ class Driver(Node):
 
         super().__init__("no_circle_driver")
 
-        self.declare_parameter("default_lane_width", 100.0)
-        self.declare_parameter("max_speed", 0.20)
-        self.declare_parameter("center_offset_px", 10.0)
+        self.declare_parameter("default_lane_width", DEFAULT_LANE_WIDTH)
+        self.declare_parameter("max_speed", DEFAULT_MAX_SPEED)
+        self.declare_parameter("center_offset_px", DEFAULT_CENTER_OFFSET_PX)
         default_lane_width = self.get_parameter("default_lane_width").value
         self.max_speed = self.get_parameter("max_speed").value
         self.center_offset_px = self.get_parameter("center_offset_px").value
@@ -173,14 +200,9 @@ class Driver(Node):
     def cb(self, msg):
 
         mask = self.bridge.imgmsg_to_cv2(msg, "mono8")
-        h, w = mask.shape
+        _, w = mask.shape
 
-        center, state = self.lane.calculate_target_center(mask)
-
-        if state == STATE_LOST:
-            center = self.lane.fallback_drivable_area(mask)
-            if center is not None:
-                state = STATE_DRIVABLE
+        center, state, multiplier = self.lane.update(mask)
 
         cmd = Twist()
 
@@ -193,14 +215,18 @@ class Driver(Node):
             self.pub.publish(cmd)
             return
 
-        desired_center = (w / 2.0)
+        desired_center = (
+            (w / 2.0) + (self.center_offset_px * multiplier)
+            if state != STATE_BOTH
+            else (w / 2.0)
+        )
         raw_error = desired_center - center
         smoothed_error = self.error_filter.filter(raw_error)
         omega = self.ctrl.compute(smoothed_error)
 
         speed = self.max_speed - abs(omega) * 0.08
         if state in (STATE_LEFT_ONLY, STATE_RIGHT_ONLY, STATE_DRIVABLE):
-            speed = min(speed, self.max_speed * 0.8)
+            speed = min(speed, self.max_speed * 0.65)
         speed = float(np.clip(speed, 0.05, self.max_speed))
 
         cmd.linear.x = speed

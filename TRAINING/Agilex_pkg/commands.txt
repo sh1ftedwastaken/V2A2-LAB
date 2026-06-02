@@ -7,8 +7,13 @@ TERMINAL 2:
 source ~/limo_code_StutiRuparel/install/setup.bash
 ros2 launch orbbec_camera dabai_dcw2.launch.py
 
+TERMINAL 3:
+source ~/limo_code_StutiRuparel/install/setup.bash
+source ~/limo_code_StutiRuparel/src/install/setup.bash
+ros2 launch ydlidar_ros2_driver ydlidar_launch.py 
 
-TERMINAL 3: 
+
+TERMINAL 4: 
 source ~/limo_code_StutiRuparel/install/setup.bash
 python3 /home/agilex/limo_code_StutiRuparel/bev2/limo_segmentation_node.py \
 --ros-args \
@@ -24,7 +29,7 @@ python3 /home/agilex/limo_code_StutiRuparel/bev2/limo_segmentation_node.py \
 -p bev_mask_height:=120
 
 
-TERMINAL 4:
+TERMINAL 5:
 source ~/limo_code_StutiRuparel/install/setup.bash
 python3 /home/agilex/limo_code_StutiRuparel/bev2/seg_bev_node.py \
 --ros-args \
@@ -35,21 +40,21 @@ python3 /home/agilex/limo_code_StutiRuparel/bev2/seg_bev_node.py \
 -p mask_height:=120
 
 
-TERMINAL 5:
+TERMINAL 6:
 source ~/limo_code_StutiRuparel/install/setup.bash
 ros2 run rqt_image_view rqt_image_view
 
 
-TERMINAL 6:
+TERMINAL 7:
 source ~/limo_code_StutiRuparel/install/setup.bash
 python3 /home/agilex/limo_code_StutiRuparel/bev2/debug_visualizer.py
 
 
-TERMINAL 7:
+TERMINAL 8:
 source ~/limo_code_StutiRuparel/install/setup.bash
 python3 /home/agilex/limo_code_StutiRuparel/bev2/autonomous_driving.py \
 --ros-args \
--p center_offset_px:=10
+-p max_speed:=0.25
 
 
 

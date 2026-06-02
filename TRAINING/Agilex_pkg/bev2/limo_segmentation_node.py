@@ -95,29 +95,29 @@ class LimoSegmentationNode(Node):
         self.declare_parameter("save_predictions", False)
         self.declare_parameter("overlay_alpha", 0.45)
 
-        cam_topic = self.get_parameter("camera_topic").value
-        out_topic = self.get_parameter("output_topic").value
-        mask_topic = self.get_parameter("mask_topic").value
+        cam_topic      = self.get_parameter("camera_topic").value
+        out_topic      = self.get_parameter("output_topic").value
+        mask_topic     = self.get_parameter("mask_topic").value
         mask_raw_topic = self.get_parameter("mask_raw_topic").value
-        label_topic = self.get_parameter("label_topic").value
-        overlay_topic = self.get_parameter("overlay_topic").value
+        label_topic    = self.get_parameter("label_topic").value
+        overlay_topic  = self.get_parameter("overlay_topic").value
 
-        self.save_dir = os.path.expanduser(self.get_parameter("save_dir").value)
-        self.save_every = self.get_parameter("save_every").value
-        self.segment_every = self.get_parameter("segment_every").value
-        self.tgt_w = self.get_parameter("target_width").value
-        self.tgt_h = self.get_parameter("target_height").value
-        self.model_w = self.get_parameter("model_input_width").value
-        self.model_h = self.get_parameter("model_input_height").value
-        self.bev_mask_w = self.get_parameter("bev_mask_width").value
-        self.bev_mask_h = self.get_parameter("bev_mask_height").value
-        self.pad_to_multiple = self.get_parameter("pad_to_multiple").value
-        self.publish_overlay = self.get_parameter("publish_overlay").value
+        self.save_dir         = os.path.expanduser(self.get_parameter("save_dir").value)
+        self.save_every       = self.get_parameter("save_every").value
+        self.segment_every    = self.get_parameter("segment_every").value
+        self.tgt_w            = self.get_parameter("target_width").value
+        self.tgt_h            = self.get_parameter("target_height").value
+        self.model_w          = self.get_parameter("model_input_width").value
+        self.model_h          = self.get_parameter("model_input_height").value
+        self.bev_mask_w       = self.get_parameter("bev_mask_width").value
+        self.bev_mask_h       = self.get_parameter("bev_mask_height").value
+        self.pad_to_multiple  = self.get_parameter("pad_to_multiple").value
+        self.publish_overlay  = self.get_parameter("publish_overlay").value
         self.save_predictions = self.get_parameter("save_predictions").value
-        self.overlay_alpha = float(self.get_parameter("overlay_alpha").value)
-        checkpoint = self.get_parameter("checkpoint").value
-        model_name = self.get_parameter("model_name").value
-        encoder_weights = self.get_parameter("encoder_weights").value
+        self.overlay_alpha    = float(self.get_parameter("overlay_alpha").value)
+        checkpoint            = self.get_parameter("checkpoint").value
+        model_name            = self.get_parameter("model_name").value
+        encoder_weights       = self.get_parameter("encoder_weights").value
 
         if not checkpoint:
             raise ValueError("checkpoint parameter must point to a trained model.")
@@ -168,15 +168,15 @@ class LimoSegmentationNode(Node):
         self.get_logger().info("Node ready - waiting for images...")
 
     def _pad_image_for_model(self, image_rgb: np.ndarray):
-        multiple = max(1, int(self.pad_to_multiple))
+        multiple      = max(1, int(self.pad_to_multiple))
         height, width = image_rgb.shape[:2]
-        padded_h = int(math.ceil(height / multiple) * multiple)
-        padded_w = int(math.ceil(width / multiple) * multiple)
+        padded_h      = int(math.ceil(height / multiple) * multiple)
+        padded_w      = int(math.ceil(width / multiple) * multiple)
 
-        pad_top = (padded_h - height) // 2
+        pad_top    = (padded_h - height) // 2
         pad_bottom = padded_h - height - pad_top
-        pad_left = (padded_w - width) // 2
-        pad_right = padded_w - width - pad_left
+        pad_left   = (padded_w - width) // 2
+        pad_right  = padded_w - width - pad_left
 
         padded = cv2.copyMakeBorder(
             image_rgb,
@@ -260,12 +260,12 @@ class LimoSegmentationNode(Node):
                     self.pub_overlay.publish(overlay_msg)
             except Exception as exc:
                 self.get_logger().warn(f"Segmentation failed: {exc}")
-                full_mask = None
-                label_bgr = None
+                full_mask   = None
+                label_bgr   = None
                 overlay_bgr = None
         else:
-            full_mask = None
-            label_bgr = None
+            full_mask   = None
+            label_bgr   = None
             overlay_bgr = None
 
         if self.frame_count % self.save_every == 0:

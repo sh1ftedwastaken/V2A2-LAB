@@ -5,8 +5,9 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, LaserScan
 from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
 
@@ -45,26 +46,7 @@ class EdgeLaneTracker:
         self.roi_end_ratio = float(roi_end_ratio)
         self.alpha_width = 0.05
 
-    def roi_bounds(self, mask):
-        h, _ = mask.shape
-        return int(h * self.roi_start_ratio), int(h * self.roi_end_ratio)
-
-    def lane_measurement(self, roi, cls):
-        _, xs = np.where(roi == cls)
-
-        if len(xs) < 12:
-            return None, 0
-
-        return float(np.median(xs)), len(xs)
-
-    def update_lane_width(self, yellow_x, white_x):
-        measured_width = abs(white_x - yellow_x)
-        self.running_lane_width = (
-            self.alpha_width * measured_width
-            + (1.0 - self.alpha_width) * self.running_lane_width
-        )
-
-    def calculate_target_center(self, mask):
+    def _calculate_target_center(self, mask):
         _, w = mask.shape
         car_center = (w / 2.0)
         half_lane = self.running_lane_width / 2.0
@@ -99,8 +81,8 @@ class EdgeLaneTracker:
             return white_x + half_lane, STATE_LEFT_ONLY
 
         return None, STATE_LOST
-
-    def fallback_drivable_area(self, mask):
+    
+    def _fallback_drivable_area(self, mask):
         y0, y1 = self.roi_bounds(mask)
         roi = mask[y0:y1, :]
 
@@ -110,13 +92,32 @@ class EdgeLaneTracker:
             return float(np.median(xs))
 
         return None
+    
+    def roi_bounds(self, mask):
+        h, _ = mask.shape
+        return int(h * self.roi_start_ratio), int(h * self.roi_end_ratio)
+
+    def lane_measurement(self, roi, cls):
+        _, xs = np.where(roi == cls)
+
+        if len(xs) < 12:
+            return None, 0
+
+        return float(np.median(xs)), len(xs)
+
+    def update_lane_width(self, yellow_x, white_x):
+        measured_width = abs(white_x - yellow_x)
+        self.running_lane_width = (
+            self.alpha_width * measured_width
+            + (1.0 - self.alpha_width) * self.running_lane_width
+        )
 
     def update(self, mask):
-        center, state = self.calculate_target_center(mask)
+        center, state = self._calculate_target_center(mask)
         multiplier = 1.0
 
         if state == STATE_LOST:
-            center = self.fallback_drivable_area(mask)
+            center = self._fallback_drivable_area(mask)
             if center is not None:
                 state = STATE_DRIVABLE
         elif state == STATE_RIGHT_ONLY:
@@ -165,16 +166,15 @@ class Controller:
         self.prev = error
 
         omega = self.kp * error + self.kd * d
-        return float(np.clip(omega, -0.4, 0.4))
+        return float(np.clip(omega, -0.45, 0.45))
 
 
 # =========================================================
 # NODE
 # =========================================================
 class Driver(Node):
-
+    
     def __init__(self):
-
         super().__init__("no_circle_driver")
 
         self.declare_parameter("default_lane_width", DEFAULT_LANE_WIDTH)
@@ -191,20 +191,49 @@ class Driver(Node):
         )
         self.ctrl = Controller()
         self.error_filter = LowPassFilter(alpha=0.25)
-
+        
+        self.obstacle_dist = float("inf")
+        
+        self.create_subscription(LaserScan, "/scan", self.lidar_cb, qos_profile_sensor_data)
         self.create_subscription(Image, "/seg/bev_mask", self.cb, 1)
+        
         self.pub = self.create_publisher(Twist, "/cmd_vel", 1)
 
         self.get_logger().info("NO-CIRCLE LANE DRIVER ACTIVE")
 
+
+    def lidar_cb(self, msg):
+        front_ranges = []
+        
+        for i, d in enumerate(msg.ranges):
+            angle = msg.angle_min + (i * msg.angle_increment)
+            
+            if -0.26 <= angle <= 0.26 and msg.range_min < d < msg.range_max:
+                    front_ranges.append(d)
+        
+        if front_ranges:
+            self.obstacle_dist = min(front_ranges)
+        else:
+            self.obstacle_dist = float("inf")
+            
+            
     def cb(self, msg):
 
         mask = self.bridge.imgmsg_to_cv2(msg, "mono8")
         _, w = mask.shape
 
-        center, state, multiplier = self.lane.update(mask)
-
+        SAFETY_STOP_DISTANCE = 0.5 # cm
+        
         cmd = Twist()
+        
+        if self.obstacle_dist < SAFETY_STOP_DISTANCE:
+            self.get_logger().warn(f"Obstacle ahead! Dist: {self.obstacle_dist:.2f} m.")
+            cmd.linear.x = 0.0
+            cmd.angular.z = 0.0
+            self.pub.publish(cmd)
+            return
+        
+        center, state, multiplier = self.lane.update(mask)
 
         if center is None:
             self.get_logger().warn(
@@ -226,7 +255,7 @@ class Driver(Node):
 
         speed = self.max_speed - abs(omega) * 0.08
         if state in (STATE_LEFT_ONLY, STATE_RIGHT_ONLY, STATE_DRIVABLE):
-            speed = min(speed, self.max_speed * 0.8)
+            speed = min(speed, self.max_speed * 0.65)
         speed = float(np.clip(speed, 0.05, self.max_speed))
 
         cmd.linear.x = speed

@@ -77,13 +77,13 @@ class SegBEVNode(Node):
         self.declare_parameter("bev_dst_top_y", 5.0)
         self.declare_parameter("bev_dst_bottom_y", 155.0)
 
-        mask_topic = self.get_parameter("mask_topic").value
-        params_path = self.get_parameter("camera_params").value
-        self.bev_size = self.get_parameter("bev_size").value
-        self.mask_w = self.get_parameter("mask_width").value
-        self.mask_h = self.get_parameter("mask_height").value
+        self.bev_size      = self.get_parameter("bev_size").value
+        self.mask_w        = self.get_parameter("mask_width").value
+        self.mask_h        = self.get_parameter("mask_height").value
+        mask_topic         = self.get_parameter("mask_topic").value
+        params_path        = self.get_parameter("camera_params").value
         default_lane_width = self.get_parameter("default_lane_width").value
-        center_offset_px = self.get_parameter("center_offset_px").value
+        center_offset_px   = self.get_parameter("center_offset_px").value
 
         with open(params_path, "r", encoding="utf-8") as handle:
             cam = yaml.safe_load(handle)
@@ -109,9 +109,9 @@ class SegBEVNode(Node):
              self.get_parameter("bev_src_top_left_y").value],
         ])
         dst_margin_x = self.get_parameter("bev_dst_margin_x").value
-        dst_top_y = self.get_parameter("bev_dst_top_y").value
+        dst_top_y    = self.get_parameter("bev_dst_top_y").value
         dst_bottom_y = self.get_parameter("bev_dst_bottom_y").value
-        dst_points = np.float32([
+        dst_points   = np.float32([
             [dst_margin_x, dst_bottom_y],
             [self.bev_size - dst_margin_x, dst_bottom_y],
             [self.bev_size - dst_margin_x, dst_top_y],
@@ -126,10 +126,10 @@ class SegBEVNode(Node):
         )
         self._frames = 0
         
-        self.sub = self.create_subscription(Image, mask_topic, self.image_callback, 10)
+        self.sub          = self.create_subscription(Image, mask_topic, self.image_callback, 10)
         self.pub_bev_mask = self.create_publisher(Image, "/seg/bev_mask", 10)
-        self.pub_bev = self.create_publisher(Image, "/seg/bev", 10)
-        self.pub_overlay = self.create_publisher(Image, "/seg/bev_overlay", 10)
+        self.pub_bev      = self.create_publisher(Image, "/seg/bev", 10)
+        self.pub_overlay  = self.create_publisher(Image, "/seg/bev_overlay", 10)
 
         self.get_logger().info(f"Subscribed to mask topic: {mask_topic}")
         self.get_logger().info(f"Expected mask size     : {self.mask_w}x{self.mask_h}")
@@ -149,10 +149,10 @@ class SegBEVNode(Node):
         _, w = mask.shape
         y0, y1 = self.lane_debug.roi_bounds(mask)
 
-        roi_mask = mask[y0:y1, :]
+        roi_mask    = mask[y0:y1, :]
         roi_overlay = overlay[y0:y1, :]
         roi_overlay[roi_mask == CLASS_YELLOW] = DEBUG_USED_YELLOW
-        roi_overlay[roi_mask == CLASS_WHITE] = DEBUG_USED_WHITE
+        roi_overlay[roi_mask == CLASS_WHITE]  = DEBUG_USED_WHITE
 
         cv2.rectangle(overlay, (0, y0), (w - 1, y1 - 1), DEBUG_ROI, 1)
 
@@ -177,7 +177,13 @@ class SegBEVNode(Node):
                 DEBUG_CENTER,
                 2,
             )
-            cv2.circle(overlay, (center_x, center_y), 4, DEBUG_CENTER, -1)
+            cv2.circle(
+                overlay, 
+                (center_x, center_y), 
+                4, 
+                DEBUG_CENTER, 
+                -1
+            )
 
         cv2.putText(
             overlay,
@@ -194,7 +200,11 @@ class SegBEVNode(Node):
     def image_callback(self, msg: Image):
         mask = self.bridge.imgmsg_to_cv2(msg, desired_encoding="mono8")
         if mask.shape[:2] != (self.mask_h, self.mask_w):
-            mask = cv2.resize(mask, (self.mask_w, self.mask_h), interpolation=cv2.INTER_NEAREST)
+            mask = cv2.resize(
+                mask, 
+                (self.mask_w, self.mask_h), 
+                interpolation=cv2.INTER_NEAREST
+            )
 
         mask_undist = undistort_mask(mask, self.k, self.d)
         bev_mask = to_bev(
@@ -204,16 +214,16 @@ class SegBEVNode(Node):
         )
         bev_clean = cleanup_bev(bev_mask)
 
-        bev_msg = self.bridge.cv2_to_imgmsg(bev_clean, encoding="mono8")
+        bev_msg        = self.bridge.cv2_to_imgmsg(bev_clean, encoding="mono8")
         bev_msg.header = msg.header
         self.pub_bev_mask.publish(bev_msg)
 
-        bev_color = self.colorize(bev_clean)
+        bev_color   = self.colorize(bev_clean)
         bev_vis_msg = self.bridge.cv2_to_imgmsg(bev_color, encoding="bgr8")
         bev_vis_msg.header = msg.header
         self.pub_bev.publish(bev_vis_msg)
 
-        overlay = self.driving_overlay(bev_clean)
+        overlay     = self.driving_overlay(bev_clean)
         overlay_msg = self.bridge.cv2_to_imgmsg(overlay, encoding="bgr8")
         overlay_msg.header = msg.header
         self.pub_overlay.publish(overlay_msg)
