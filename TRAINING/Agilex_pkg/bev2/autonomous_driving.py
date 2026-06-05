@@ -11,22 +11,29 @@ from sensor_msgs.msg import Image, LaserScan
 from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
 
-
-CLASS_WHITE = 2
+# =========================================================
+# UNIVERSAL STATES
+# =========================================================
+CLASS_WHITE  = 2
 CLASS_YELLOW = 3
-CLASS_ROAD = 1
+CLASS_ROAD   = 1
 
-STATE_BOTH = "BOTH_LANES"
-STATE_LEFT_ONLY = "LEFT_LANE_ONLY"
+STATE_BOTH       = "BOTH_LANES"
+STATE_LEFT_ONLY  = "LEFT_LANE_ONLY"
 STATE_RIGHT_ONLY = "RIGHT_LANE_ONLY"
-STATE_DRIVABLE = "DRIVABLE_AREA_MODE"
-STATE_LOST = "LOST"
+STATE_DRIVABLE   = "DRIVABLE_AREA_MODE"
+STATE_LOST       = "LOST"
 
-DEFAULT_LANE_WIDTH = 100.0
-DEFAULT_MAX_SPEED = 0.20
+STATE_LANE_KEEP = "LANE_KEEP"
+STATE_CHANGING_LANE = "CHANGING_LANE"
+STATE_PASSING = "PASSING"
+STATE_RETURNING = "RETURNING"
+
+DEFAULT_LANE_WIDTH       = 100.0
+DEFAULT_MAX_SPEED        = 0.20
 DEFAULT_CENTER_OFFSET_PX = 17.0
-DEFAULT_ROI_START_RATIO = 0.60
-DEFAULT_ROI_END_RATIO = 0.84
+DEFAULT_ROI_START_RATIO  = 0.60
+DEFAULT_ROI_END_RATIO    = 0.84
 
 # =========================================================
 # LANE TRACKER
@@ -41,10 +48,10 @@ class EdgeLaneTracker:
         roi_end_ratio=DEFAULT_ROI_END_RATIO,
     ):
         self.running_lane_width = float(default_lane_width)
-        self.center_offset_px = float(center_offset_px)
-        self.roi_start_ratio = float(roi_start_ratio)
-        self.roi_end_ratio = float(roi_end_ratio)
-        self.alpha_width = 0.05
+        self.center_offset_px   = float(center_offset_px)
+        self.roi_start_ratio    = float(roi_start_ratio)
+        self.roi_end_ratio      = float(roi_end_ratio)
+        self.alpha_width        = 0.05
 
     def _calculate_target_center(self, mask):
         _, w = mask.shape
@@ -132,15 +139,15 @@ class EdgeLaneTracker:
 class LowPassFilter:
 
     def __init__(self, alpha=0.25):
-        self.alpha = alpha
-        self.initialized = False
+        self.alpha         = alpha
+        self.initialized   = False
         self.current_value = 0.0
 
     def filter(self, value):
 
         if not self.initialized:
             self.current_value = value
-            self.initialized = True
+            self.initialized   = True
             return value
 
         self.current_value = (
@@ -156,8 +163,8 @@ class LowPassFilter:
 class Controller:
 
     def __init__(self):
-        self.kp = 0.012
-        self.kd = 0.004
+        self.kp   = 0.012
+        self.kd   = 0.004
         self.prev = 0.0
 
     def compute(self, error):
@@ -180,8 +187,8 @@ class Driver(Node):
         self.declare_parameter("default_lane_width", DEFAULT_LANE_WIDTH)
         self.declare_parameter("max_speed", DEFAULT_MAX_SPEED)
         self.declare_parameter("center_offset_px", DEFAULT_CENTER_OFFSET_PX)
-        default_lane_width = self.get_parameter("default_lane_width").value
-        self.max_speed = self.get_parameter("max_speed").value
+        default_lane_width    = self.get_parameter("default_lane_width").value
+        self.max_speed        = self.get_parameter("max_speed").value
         self.center_offset_px = self.get_parameter("center_offset_px").value
 
         self.bridge = CvBridge()
@@ -193,6 +200,12 @@ class Driver(Node):
         self.error_filter = LowPassFilter(alpha=0.25)
         
         self.obstacle_dist = float("inf")
+        self.left_clear    = True
+        self.right_clear   = True
+        
+        self.behavior_state = STATE_LANE_KEEP
+        self.overtake_side  = None
+        self.direction_sign = 0           # +1 left, -1 right, 0 none    
         
         self.create_subscription(LaserScan, "/scan", self.lidar_cb, qos_profile_sensor_data)
         self.create_subscription(Image, "/seg/bev_mask", self.cb, 1)
@@ -204,17 +217,23 @@ class Driver(Node):
 
     def lidar_cb(self, msg):
         front_ranges = []
+        left_ranges  = []
+        right_ranges = []
         
-        for i, d in enumerate(msg.ranges):
+        for i, dist in enumerate(msg.ranges):
             angle = msg.angle_min + (i * msg.angle_increment)
             
-            if -0.26 <= angle <= 0.26 and msg.range_min < d < msg.range_max:
-                    front_ranges.append(d)
+            if msg.range_min < dist < msg.range_max:
+                if -0.26 <= angle <= 0.26:
+                    front_ranges.append(dist)
+                elif 0.52 <= angle <= 1.31:
+                    left_ranges.append(dist)
+                elif -1.31 <= angle <= -0.52:
+                    right_ranges.append(dist)
         
-        if front_ranges:
-            self.obstacle_dist = min(front_ranges)
-        else:
-            self.obstacle_dist = float("inf")
+        self.obstacle_dist = min(front_ranges) if front_ranges else float("inf")
+        self.left_clear = min(left_ranges) > 0.35 if left_ranges else True
+        self.right_clear = min(right_ranges) > 0.35 if right_ranges else True
             
             
     def cb(self, msg):
@@ -222,12 +241,13 @@ class Driver(Node):
         mask = self.bridge.imgmsg_to_cv2(msg, "mono8")
         _, w = mask.shape
 
-        SAFETY_STOP_DISTANCE = 0.5 # cm
-        
         cmd = Twist()
         
+        SAFETY_STOP_DISTANCE = 0.3 # cm
         if self.obstacle_dist < SAFETY_STOP_DISTANCE:
-            self.get_logger().warn(f"Obstacle ahead! Dist: {self.obstacle_dist:.2f} m.")
+            self.get_logger().warn(
+                f"Obstacle ahead! Dist: {self.obstacle_dist:.2f} m."
+            )
             cmd.linear.x = 0.0
             cmd.angular.z = 0.0
             self.pub.publish(cmd)
@@ -255,8 +275,8 @@ class Driver(Node):
 
         speed = self.max_speed - abs(omega) * 0.08
         if state in (STATE_LEFT_ONLY, STATE_RIGHT_ONLY, STATE_DRIVABLE):
-            speed = min(speed, self.max_speed * 0.65)
-        speed = float(np.clip(speed, 0.05, self.max_speed))
+            speed = min(speed, self.max_speed * 0.70)
+        speed = float(np.clip(speed, 0.1, self.max_speed))
 
         cmd.linear.x = speed
         cmd.angular.z = omega
