@@ -65,8 +65,8 @@ python3 ~/limo_code_StutiRuparel/src/limo_camera_pkg/limo_camera_pkg/four_wheel_
 
 TERMINAL: 
 source ~/limo_code_StutiRuparel/install/setup.bash
-python3 ~/limo_ros2_ws/src/limo_camera_pkg/limo_camera_pkg/limo_teleop_key.py \
+python3 ~/limo_code_StutiRuparel/src/limo_camera_pkg/limo_camera_pkg/limo_teleop_key.py \
     --ros-args -p drive_mode:=diff \
-    -p cmd_topic:=/cmd_vel_raw \
+    -p cmd_topic:=/cmd_vel \
     -p linear_speed:=0.15 \
     -p angular_speed:=0.4

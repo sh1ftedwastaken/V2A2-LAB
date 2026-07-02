@@ -22,8 +22,8 @@ CLASS_VEHICLE = 4
 
 
 CLASS_COLORS = {
-    CLASS_BG: (40, 40, 40),
-    CLASS_ROAD: (60, 120, 60),
+    CLASS_BG: (0, 255, 0),
+    CLASS_ROAD: (100, 100, 100),
     CLASS_WHITE: (255, 255, 255),
     CLASS_YELLOW: (0, 255, 255),
     CLASS_VEHICLE: (0, 0, 255),
@@ -44,12 +44,14 @@ class DebugVisualizer(Node):
         self.bridge = CvBridge()
 
         self.create_subscription(Image, "/camera/color/image_raw", self.raw_cb, 1)
+        self.create_subscription(Image, "/seg/cam_overlay", self.cam_overlay_cb, 1)
         self.create_subscription(Image, "/seg/mask_raw", self.seg_cb, 1)
         self.create_subscription(Image, "/seg/bev_mask", self.bev_cb, 1)
         self.create_subscription(Image, "/seg/bev_overlay", self.center_cb, 1)
         self.create_subscription(String, "/debug/status", self.status_cb, 1)
 
         self.raw = None
+        self.cam_overlay = None
         self.seg = None
         self.bev = None
         self.center = None
@@ -81,6 +83,9 @@ class DebugVisualizer(Node):
     def raw_cb(self, msg):
         self.raw = self.bridge.imgmsg_to_cv2(msg, "bgr8")
 
+    def cam_overlay_cb(self, msg):
+        self.cam_overlay = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+
     def seg_cb(self, msg):
         self.seg = self.bridge.imgmsg_to_cv2(msg, "mono8")
 
@@ -108,17 +113,39 @@ class DebugVisualizer(Node):
 
         return out
 
+    def camera_overlay_panel(self, raw):
+        overlay = self.cam_overlay if self.cam_overlay is not None else raw
+        raw_panel = cv2.resize(raw, (640, 480))
+        overlay_panel = cv2.resize(overlay, (640, 480))
+
+        panel = overlay_panel.copy()
+        inset_w, inset_h = 170, 128
+        margin = 10
+        inset = cv2.resize(raw_panel, (inset_w, inset_h))
+        x0 = margin
+        y0 = panel.shape[0] - inset_h - margin
+        panel[y0:y0 + inset_h, x0:x0 + inset_w] = inset
+        cv2.rectangle(
+            panel,
+            (x0, y0),
+            (x0 + inset_w, y0 + inset_h),
+            (235, 235, 235),
+            2,
+        )
+        return panel
+
     def render(self):
 
         if self.raw is None:
             return
 
         raw = self.raw.copy()
+        camera_overlay = self.camera_overlay_panel(raw)
         seg = self.colorize(self.seg)
         bev = self.colorize(self.bev)
 
         canvas = np.hstack([
-            cv2.resize(raw, (640, 480)),
+            camera_overlay,
             cv2.resize(seg, (640, 480)),
             cv2.resize(bev, (640, 480)),
             cv2.resize(self.center if self.center is not None else bev, (640, 480)),
