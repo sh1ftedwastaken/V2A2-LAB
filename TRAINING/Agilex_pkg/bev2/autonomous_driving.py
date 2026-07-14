@@ -11,126 +11,32 @@ from sensor_msgs.msg import Image, LaserScan
 from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
 
-# =========================================================
-# UNIVERSAL STATES
-# =========================================================
-CLASS_WHITE  = 2
-CLASS_YELLOW = 3
-CLASS_ROAD   = 1
+# Import shared lane analyzer
+from lane_analyzer import (
+    LaneAnalyzer,
+    STATE_BOTH,
+    STATE_LEFT_ONLY,
+    STATE_RIGHT_ONLY,
+    STATE_DRIVABLE,
+    STATE_LOST,
+    DEFAULT_LANE_WIDTH_PX,
+    DEFAULT_ROI_START_RATIO,
+    DEFAULT_ROI_END_RATIO,
+    CLASS_ROAD,
+    CLASS_YELLOW,
+    CLASS_WHITE,
+)
 
-STATE_BOTH       = "BOTH_LANES"
-STATE_LEFT_ONLY  = "LEFT_LANE_ONLY"
-STATE_RIGHT_ONLY = "RIGHT_LANE_ONLY"
-STATE_DRIVABLE   = "DRIVABLE_AREA_MODE"
-STATE_LOST       = "LOST"
-
+# =========================================================
+# UNIVERSAL STATES (behavior states for overtaking logic)
+# =========================================================
 STATE_LANE_KEEP = "LANE_KEEP"
 STATE_CHANGING_LANE = "CHANGING_LANE"
 STATE_PASSING = "PASSING"
 STATE_RETURNING = "RETURNING"
 
-DEFAULT_LANE_WIDTH       = 100.0
 DEFAULT_MAX_SPEED        = 0.20
 DEFAULT_CENTER_OFFSET_PX = 17.0
-DEFAULT_ROI_START_RATIO  = 0.60
-DEFAULT_ROI_END_RATIO    = 0.84
-
-# =========================================================
-# LANE TRACKER
-# =========================================================
-class EdgeLaneTracker:
-
-    def __init__(
-        self,
-        default_lane_width=DEFAULT_LANE_WIDTH,
-        center_offset_px=DEFAULT_CENTER_OFFSET_PX,
-        roi_start_ratio=DEFAULT_ROI_START_RATIO,
-        roi_end_ratio=DEFAULT_ROI_END_RATIO,
-    ):
-        self.running_lane_width = float(default_lane_width)
-        self.center_offset_px   = float(center_offset_px)
-        self.roi_start_ratio    = float(roi_start_ratio)
-        self.roi_end_ratio      = float(roi_end_ratio)
-        self.alpha_width        = 0.05
-
-    def _calculate_target_center(self, mask):
-        _, w = mask.shape
-        car_center = (w / 2.0)
-        half_lane = self.running_lane_width / 2.0
-
-        y0, y1 = self.roi_bounds(mask)
-        roi = mask[y0:y1, :]
-
-        yellow_x, yellow_count = self.lane_measurement(roi, CLASS_YELLOW)
-        white_x, white_count = self.lane_measurement(roi, CLASS_WHITE)
-
-        if yellow_x is None and white_x is None:
-            return None, STATE_LOST
-
-        if yellow_x is not None and white_x is not None:
-            if abs(white_x - yellow_x) >= 35:
-                self.update_lane_width(yellow_x, white_x)
-                return (yellow_x + white_x) / 2.0, STATE_BOTH
-
-            if yellow_count >= white_count:
-                white_x = None
-            else:
-                yellow_x = None
-
-        if yellow_x is not None:
-            if yellow_x < car_center:
-                return yellow_x + half_lane, STATE_LEFT_ONLY
-            return yellow_x - half_lane, STATE_RIGHT_ONLY
-
-        if white_x is not None:
-            if white_x > car_center:
-                return white_x - half_lane, STATE_RIGHT_ONLY
-            return white_x + half_lane, STATE_LEFT_ONLY
-
-        return None, STATE_LOST
-    
-    def _fallback_drivable_area(self, mask):
-        y0, y1 = self.roi_bounds(mask)
-        roi = mask[y0:y1, :]
-
-        _, xs = np.where(roi == CLASS_ROAD)
-
-        if len(xs) > 50:
-            return float(np.median(xs))
-
-        return None
-    
-    def roi_bounds(self, mask):
-        h, _ = mask.shape
-        return int(h * self.roi_start_ratio), int(h * self.roi_end_ratio)
-
-    def lane_measurement(self, roi, cls):
-        _, xs = np.where(roi == cls)
-
-        if len(xs) < 12:
-            return None, 0
-
-        return float(np.median(xs)), len(xs)
-
-    def update_lane_width(self, yellow_x, white_x):
-        measured_width = abs(white_x - yellow_x)
-        self.running_lane_width = (
-            self.alpha_width * measured_width
-            + (1.0 - self.alpha_width) * self.running_lane_width
-        )
-
-    def update(self, mask):
-        center, state = self._calculate_target_center(mask)
-        multiplier = 1.0
-
-        if state == STATE_LOST:
-            center = self._fallback_drivable_area(mask)
-            if center is not None:
-                state = STATE_DRIVABLE
-        elif state == STATE_RIGHT_ONLY:
-            multiplier = -1.0
-            
-        return center, state, multiplier
 
 
 # =========================================================
@@ -163,8 +69,8 @@ class LowPassFilter:
 class Controller:
 
     def __init__(self):
-        self.kp   = 0.012
-        self.kd   = 0.004
+        self.kp   = 0.015
+        self.kd   = 0.005
         self.prev = 0.0
 
     def compute(self, error):
@@ -184,17 +90,27 @@ class Driver(Node):
     def __init__(self):
         super().__init__("no_circle_driver")
 
-        self.declare_parameter("default_lane_width", DEFAULT_LANE_WIDTH)
+        self.declare_parameter("default_lane_width", DEFAULT_LANE_WIDTH_PX)
         self.declare_parameter("max_speed", DEFAULT_MAX_SPEED)
         self.declare_parameter("center_offset_px", DEFAULT_CENTER_OFFSET_PX)
+        self.declare_parameter("roi_start_ratio", DEFAULT_ROI_START_RATIO)
+        self.declare_parameter("roi_end_ratio", DEFAULT_ROI_END_RATIO)
+        
         default_lane_width    = self.get_parameter("default_lane_width").value
         self.max_speed        = self.get_parameter("max_speed").value
         self.center_offset_px = self.get_parameter("center_offset_px").value
+        roi_start_ratio       = self.get_parameter("roi_start_ratio").value
+        roi_end_ratio         = self.get_parameter("roi_end_ratio").value
 
         self.bridge = CvBridge()
-        self.lane = EdgeLaneTracker(
-            default_lane_width=default_lane_width,
-            center_offset_px=self.center_offset_px,
+        
+        # Use shared LaneAnalyzer for polynomial lane fitting
+        self.lane_analyzer = LaneAnalyzer(
+            lane_width_px=default_lane_width,
+            camera_offset_x_px=-3.0,  # BEV is robot-centered, no camera offset
+            roi_start_ratio=roi_start_ratio,
+            roi_end_ratio=roi_end_ratio,
+            alpha_lane_width=0.07,
         )
         self.ctrl = Controller()
         self.error_filter = LowPassFilter(alpha=0.25)
@@ -212,7 +128,7 @@ class Driver(Node):
         
         self.pub = self.create_publisher(Twist, "/cmd_vel", 1)
 
-        self.get_logger().info("NO-CIRCLE LANE DRIVER ACTIVE")
+        self.get_logger().info("NO-CIRCLE LANE DRIVER ACTIVE (with polynomial lane tracking)")
 
 
     def lidar_cb(self, msg):
@@ -253,9 +169,10 @@ class Driver(Node):
             self.pub.publish(cmd)
             return
         
-        center, state, multiplier = self.lane.update(mask)
+        # Get polynomial lane fits from shared analyzer
+        _, _, center_coeffs, center_y_min, center_y_max, state, multiplier = self.lane_analyzer.analyze(mask)
 
-        if center is None:
+        if center_coeffs is None:
             self.get_logger().warn(
                 "CRITICAL BLINDNESS: NO TRACKING ANCHORS FOUND"
             )
@@ -264,11 +181,12 @@ class Driver(Node):
             self.pub.publish(cmd)
             return
 
-        desired_center = (
-            (w / 2.0) + (self.center_offset_px * multiplier)
-            if state != STATE_BOTH
-            else (w / 2.0)
-        )
+        # Evaluate center polynomial at ROI center (instant position for steering)
+        roi_y = (center_y_min + center_y_max) / 2.0
+        center = float(np.polyval(center_coeffs, roi_y))
+
+        # Desired center is the robot center in BEV coordinates (BEV is robot-centered)
+        desired_center = w / 2.0 + (self.center_offset_px * multiplier) if state != STATE_BOTH else w / 2.0
         raw_error = desired_center - center
         smoothed_error = self.error_filter.filter(raw_error)
         omega = self.ctrl.compute(smoothed_error)

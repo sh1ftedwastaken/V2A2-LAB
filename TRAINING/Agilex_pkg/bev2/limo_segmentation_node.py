@@ -12,7 +12,7 @@ Behaviour
 - Runs the trained model and publishes:
   - a BEV-ready single-channel mask on /seg/mask
   - a color label image on /limo/camera/label_image
-  - a camera overlay on /seg/cam_overlay
+  - a camera overlay on /seg/cam_overlay (now with polynomial lane curves)
 - Optionally saves raw frames and predicted outputs.
 """
 from __future__ import annotations #keep this since the limo car has a python version older
@@ -35,6 +35,22 @@ from std_msgs.msg import Bool, String
 from cv_bridge import CvBridge, CvBridgeError
 
 from train2 import build_model
+
+# Import shared lane analysis from lane_analyzer.py
+from lane_analyzer import (
+    LaneAnalyzer,
+    LaneOverlayRenderer,
+    CLASS_BG,
+    CLASS_ROAD,
+    CLASS_WHITE,
+    CLASS_YELLOW,
+    CLASS_VEHICLE,
+    CURVE_YELLOW,
+    CURVE_WHITE,
+    CURVE_CENTER,
+    OBSTACLE_BOX,
+    EGO_AXIS,
+)
 
 
 NUM_CLASSES = 5
@@ -95,6 +111,13 @@ class LimoSegmentationNode(Node):
         self.declare_parameter("save_predictions", False)
         self.declare_parameter("overlay_alpha", 0.45)
 
+        # Camera overlay parameters (new)
+        self.declare_parameter("camera_overlay_enabled", True)
+        self.declare_parameter("camera_roi_start_ratio", 0.60)
+        self.declare_parameter("camera_roi_end_ratio", 0.84)
+        self.declare_parameter("camera_lane_width_px", 100.0)
+        self.declare_parameter("camera_offset_x_px", 0.0)
+
         cam_topic      = self.get_parameter("camera_topic").value
         out_topic      = self.get_parameter("output_topic").value
         mask_topic     = self.get_parameter("mask_topic").value
@@ -118,6 +141,13 @@ class LimoSegmentationNode(Node):
         checkpoint            = self.get_parameter("checkpoint").value
         model_name            = self.get_parameter("model_name").value
         encoder_weights       = self.get_parameter("encoder_weights").value
+
+        # Camera overlay params
+        self.camera_overlay_enabled = self.get_parameter("camera_overlay_enabled").value
+        self.camera_roi_start_ratio = self.get_parameter("camera_roi_start_ratio").value
+        self.camera_roi_end_ratio   = self.get_parameter("camera_roi_end_ratio").value
+        self.camera_lane_width_px   = self.get_parameter("camera_lane_width_px").value
+        self.camera_offset_x_px     = self.get_parameter("camera_offset_x_px").value
 
         if not checkpoint:
             raise ValueError("checkpoint parameter must point to a trained model.")
@@ -152,6 +182,16 @@ class LimoSegmentationNode(Node):
         if self.publish_overlay:
             self.pub_overlay = self.create_publisher(RosImage, overlay_topic, 2)
 
+        # Initialize shared lane analyzer and renderer for camera overlay
+        self.cam_analyzer = LaneAnalyzer(
+            lane_width_px=self.camera_lane_width_px,
+            camera_offset_x_px=self.camera_offset_x_px,
+            roi_start_ratio=self.camera_roi_start_ratio,
+            roi_end_ratio=self.camera_roi_end_ratio,
+            alpha_lane_width=0.05,
+        )
+        self.cam_renderer = LaneOverlayRenderer()
+
         self.sub = self.create_subscription(RosImage, cam_topic, self._image_callback, 1)
         self.create_timer(1.0, self._heartbeat)
 
@@ -165,6 +205,7 @@ class LimoSegmentationNode(Node):
         self.get_logger().info(f"Model input     : {self.model_w}x{self.model_h}")
         self.get_logger().info(f"Pad multiple    : {self.pad_to_multiple}")
         self.get_logger().info(f"BEV mask size   : {self.bev_mask_w}x{self.bev_mask_h}")
+        self.get_logger().info(f"Camera overlay  : {'enabled' if self.camera_overlay_enabled else 'disabled'}")
         self.get_logger().info("Node ready - waiting for images...")
 
     def _pad_image_for_model(self, image_rgb: np.ndarray):
@@ -254,8 +295,16 @@ class LimoSegmentationNode(Node):
                 label_msg.header = msg.header
                 self.pub_label.publish(label_msg)
 
-                if self.pub_overlay is not None:
-                    overlay_msg = self.bridge.cv2_to_imgmsg(overlay_bgr, encoding="bgr8")
+                # Publish camera overlay with polynomial lane curves
+                if self.pub_overlay is not None and self.camera_overlay_enabled and full_mask is not None:
+                    cam_overlay = self.cam_renderer.driving_overlay(
+                        full_mask,
+                        self.cam_analyzer,
+                        self.camera_lane_width_px,
+                        self.camera_offset_x_px,
+                        (self.camera_roi_start_ratio, self.camera_roi_end_ratio),
+                    )
+                    overlay_msg = self.bridge.cv2_to_imgmsg(cam_overlay, encoding="bgr8")
                     overlay_msg.header = msg.header
                     self.pub_overlay.publish(overlay_msg)
             except Exception as exc:
@@ -311,4 +360,3 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
-
