@@ -61,8 +61,8 @@ class SegBEVNode(Node):
         self.declare_parameter("mask_height", 120)
         self.declare_parameter("default_lane_width", 100.0)
         self.declare_parameter("camera_offset_x_px", 0.0)
-        self.declare_parameter("roi_start_ratio", 0.60)
-        self.declare_parameter("roi_end_ratio", 0.84)  
+        self.declare_parameter("roi_start_ratio", 0.75)
+        self.declare_parameter("roi_end_ratio", 0.95)  
         self.declare_parameter("calibrate_mode", False)
         
         # BEV parameters
@@ -83,10 +83,10 @@ class SegBEVNode(Node):
         # BEV destination points (square)
         # Destination Bottom Edge (y = mask_height)
         self.declare_parameter("bev_dst_bottom_left_x", 40.0)
-        self.declare_parameter("bev_dst_bottom_left_y", 120.0)
+        self.declare_parameter("bev_dst_bottom_left_y", 160.0)
 
         self.declare_parameter("bev_dst_bottom_right_x", 120.0)
-        self.declare_parameter("bev_dst_bottom_right_y", 120.0)
+        self.declare_parameter("bev_dst_bottom_right_y", 160.0)
 
         # Destination Top Edge (y = 0)
         self.declare_parameter("bev_dst_top_left_x", 40.0)

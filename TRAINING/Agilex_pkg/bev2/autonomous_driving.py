@@ -107,7 +107,7 @@ class Driver(Node):
         # Use shared LaneAnalyzer for polynomial lane fitting
         self.lane_analyzer = LaneAnalyzer(
             lane_width_px=default_lane_width,
-            camera_offset_x_px=-3.0,  # BEV is robot-centered, no camera offset
+            camera_offset_x_px=0.0,  # BEV is robot-centered, no camera offset
             roi_start_ratio=roi_start_ratio,
             roi_end_ratio=roi_end_ratio,
             alpha_lane_width=0.07,
@@ -170,9 +170,9 @@ class Driver(Node):
             return
         
         # Get polynomial lane fits from shared analyzer
-        _, _, center_coeffs, center_y_min, center_y_max, state, multiplier = self.lane_analyzer.analyze(mask)
+        _, _, center_path, center_y_min, center_y_max, state, multiplier = self.lane_analyzer.analyze(mask)
 
-        if center_coeffs is None:
+        if center_path is None:
             self.get_logger().warn(
                 "CRITICAL BLINDNESS: NO TRACKING ANCHORS FOUND"
             )
@@ -181,9 +181,13 @@ class Driver(Node):
             self.pub.publish(cmd)
             return
 
-        # Evaluate center polynomial at ROI center (instant position for steering)
+        # Target lookahead distance in Y
         roi_y = (center_y_min + center_y_max) / 2.0
-        center = float(np.polyval(center_coeffs, roi_y))
+
+        # Evaluate center path by finding the waypoint closest to our target Y
+        distances = np.abs(center_path[:, 1] - roi_y)
+        closest_idx = int(np.argmin(distances))
+        center = float(center_path[closest_idx, 0])
 
         # Desired center is the robot center in BEV coordinates (BEV is robot-centered)
         desired_center = w / 2.0 + (self.center_offset_px * multiplier) if state != STATE_BOTH else w / 2.0

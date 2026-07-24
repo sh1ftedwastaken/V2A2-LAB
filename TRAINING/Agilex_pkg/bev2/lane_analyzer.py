@@ -35,8 +35,8 @@ LANE_FIT_BIN_HEIGHT_PX = 4
 MIN_LANE_FIT_BINS = 8
 CURVE_RMSE_IMPROVEMENT = 0.18
 CURVE_MIN_X_SPAN_PX = 12.0
-DEFAULT_ROI_START_RATIO = 0.60
-DEFAULT_ROI_END_RATIO = 0.84
+DEFAULT_ROI_START_RATIO = 0.75
+DEFAULT_ROI_END_RATIO = 0.95
 MIN_BOTH_LANE_GAP_PX = 35.0
 MAX_COMPONENT_ROI_DISTANCE_PX = 28.0
 
@@ -80,8 +80,8 @@ STATE_DRIVABLE = "DRIVABLE_AREA_MODE"
 # DATA STRUCTURES
 # =========================================================
 class LaneFit(NamedTuple):
-    """Polynomial lane fit with metadata."""
-    coeffs: np.ndarray          # polynomial coefficients (highest degree first)
+    """Parametric lane path with metadata."""
+    path_points: np.ndarray     # N x 2 array of [x, y] coordinates
     y_min: int                  # minimum y where fit is valid
     y_max: int                  # maximum y where fit is valid
     roi_x: float                # x position in ROI used for selection
@@ -235,50 +235,47 @@ class LaneAnalyzer:
     ) -> Optional[LaneFit]:
         if y_points.size <= MIN_POLYFIT_POINTS or np.unique(y_points).size < 3:
             return None
-
+        
         fit_y, fit_x = self._binned_lane_points(y_points, x_points)
         if fit_y.size < MIN_LANE_FIT_BINS:
             return None
-
-        linear = self._polyfit_safe(fit_y, fit_x, 1)
-        if linear is None:
+            
+        # Parametric variable t (cumulative distance)
+        # Sort bottom to top (highest Y to lowest Y from robot's perspective)
+        order = np.argsort(fit_y)[::-1]
+        sy = fit_y[order]
+        sx = fit_x[order]
+        
+        dt = np.sqrt(np.diff(sx)**2 + np.diff(sy)**2)
+        t = np.zeros(len(sx))
+        t[1:] = np.cumsum(dt)
+        if t[-1] == 0:
             return None
-
-        linear_x = np.polyval(linear, fit_y)
-        linear_rmse = float(np.sqrt(np.mean((linear_x - fit_x) ** 2)))
-        best_coeffs = linear
-        best_rmse = linear_rmse
-
-        x_span = float(np.ptp(fit_x))
-        if x_span < CURVE_MIN_X_SPAN_PX:
-            best_coeffs = best_coeffs.astype(np.float64, copy=True)
-            best_coeffs[-1] += float(self.camera_offset_x_px)
-            return LaneFit(
-                best_coeffs,
-                int(np.min(fit_y)),
-                int(np.max(fit_y)),
-                float(roi_x),
-                int(count),
-                best_rmse,
-            )
-
-        curved = self._polyfit_safe(fit_y, fit_x, 2)
-        if curved is not None:
-            curved_x = np.polyval(curved, fit_y)
-            curved_rmse = float(np.sqrt(np.mean((curved_x - fit_x) ** 2)))
-            improvement = 0.0 if linear_rmse <= 1e-6 else (linear_rmse - curved_rmse) / linear_rmse
-            if improvement >= CURVE_RMSE_IMPROVEMENT and curved_rmse < best_rmse:
-                best_coeffs = curved
-
-        best_coeffs = best_coeffs.astype(np.float64, copy=True)
-        best_coeffs[-1] += float(self.camera_offset_x_px)
+        t_norm = t / t[-1]  # Normalize distance from 0.0 to 1.0
+        
+        # Fit X and Y independently based on distance t
+        degree = 2 if len(t_norm) > 3 else 1
+        coeffs_x = np.polyfit(t_norm, sx, degree)
+        coeffs_y = np.polyfit(t_norm, sy, degree)
+        
+        # Evaluate 50 discrete waypoints along the curve
+        t_eval = np.linspace(0.0, 1.0, 50)
+        path_x = np.polyval(coeffs_x, t_eval)
+        path_y = np.polyval(coeffs_y, t_eval)
+        
+        path_points = np.column_stack((path_x, path_y))
+        path_points[:, 0] += float(self.camera_offset_x_px)
+        
+        # Simple Euclidean RMSE against bins
+        rmse = 0.0 
+        
         return LaneFit(
-            best_coeffs,
+            path_points,
             int(np.min(fit_y)),
             int(np.max(fit_y)),
             float(roi_x),
             int(count),
-            best_rmse,
+            rmse,
         )
 
     # ---- Public API ----
@@ -323,14 +320,14 @@ class LaneAnalyzer:
         )
 
         # 3. Unified centerline solver
-        center_coeffs = None
+        center_path = None
         center_y_min = y0
         center_y_max = y1 - 1
         state = STATE_LOST
         multiplier = 1.0
 
         if yellow_fit is not None and white_fit is not None:
-            center_coeffs = self._average_lane_coeffs(yellow_fit.coeffs, white_fit.coeffs)
+            center_path = self._average_lane_paths(yellow_fit, white_fit)
             center_y_min = max(yellow_fit.y_min, white_fit.y_min)
             center_y_max = min(yellow_fit.y_max, white_fit.y_max)
             if center_y_min > center_y_max:
@@ -339,28 +336,33 @@ class LaneAnalyzer:
             state = STATE_BOTH
         elif yellow_fit is not None:
             offset = half_lane if yellow_fit.roi_x < ego_center else -half_lane
-            center_coeffs = self._shift_lane_coeffs(yellow_fit, offset)
+            center_path = self._shift_lane_path(yellow_fit, offset)
             center_y_min = yellow_fit.y_min
             center_y_max = yellow_fit.y_max
             state = STATE_LEFT_ONLY if yellow_fit.roi_x < ego_center else STATE_RIGHT_ONLY
         elif white_fit is not None:
             offset = -half_lane if white_fit.roi_x > ego_center else half_lane
-            center_coeffs = self._shift_lane_coeffs(white_fit, offset)
+            center_path = self._shift_lane_path(white_fit, offset)
             center_y_min = white_fit.y_min
             center_y_max = white_fit.y_max
             state = STATE_RIGHT_ONLY if white_fit.roi_x > ego_center else STATE_LEFT_ONLY
 
         if state == STATE_RIGHT_ONLY:
             multiplier = -1.0
-        
+
         # 4. Fallback to drivable area if completely lost
-        if center_coeffs is None:
+        if center_path is None:
             _, xs = np.where(roi == CLASS_ROAD)
             if len(xs) > 50:
-                center_coeffs = np.array([0.0, float(np.median(xs))], dtype=np.float64)
+                med_x = float(np.median(xs))
+                # Create a vertical straight path
+                center_path = np.column_stack((
+                    np.full(50, med_x),
+                    np.linspace(center_y_max, center_y_min, 50)
+                ))
                 state = STATE_DRIVABLE
 
-        return yellow_fit, white_fit, center_coeffs, center_y_min, center_y_max, state, multiplier
+        return yellow_fit, white_fit, center_path, center_y_min, center_y_max, state, multiplier
 
     def update_lane_width(self, measured_width: float) -> None:
         """EMA update of running lane width."""
@@ -371,16 +373,14 @@ class LaneAnalyzer:
 
     # ---- Helpers ----
 
-    def _average_lane_coeffs(self, left: np.ndarray, right: np.ndarray) -> np.ndarray:
-        degree = max(left.size, right.size)
-        left_pad = np.pad(left, (degree - left.size, 0), mode="constant")
-        right_pad = np.pad(right, (degree - right.size, 0), mode="constant")
-        return (left_pad + right_pad) / 2.0
+    def _average_lane_paths(self, left_fit: LaneFit, right_fit: LaneFit) -> np.ndarray:
+        # Averages the 50 aligned waypoints (t_eval points match 1:1)
+        return (left_fit.path_points + right_fit.path_points) / 2.0
 
-    def _shift_lane_coeffs(self, fit: LaneFit, offset_px: float) -> np.ndarray:
-        coeffs = fit.coeffs.copy()
-        coeffs[-1] += offset_px
-        return coeffs
+    def _shift_lane_path(self, fit: LaneFit, offset_px: float) -> np.ndarray:
+        shifted = fit.path_points.copy()
+        shifted[:, 0] += offset_px
+        return shifted
 
 
 # =========================================================
@@ -414,28 +414,23 @@ class LaneOverlayRenderer:
             color[mask == cls] = bgr
         return color
 
-    def draw_polynomial(
+    def draw_path(
         self,
         overlay: np.ndarray,
-        coeffs: Optional[np.ndarray],
+        path_points: Optional[np.ndarray],
         color: Tuple[int, int, int],
         thickness: int,
-        y_min: int = 0,
-        y_max: Optional[int] = None,
     ) -> None:
-        """Draw polynomial curve on overlay."""
-        if coeffs is None:
+        """Draw parametric path on overlay."""
+        if path_points is None or len(path_points) == 0:
             return
-
+        
         h, w = overlay.shape[:2]
-        if y_max is None:
-            y_max = h - 1
-        y_min = int(np.clip(y_min, 0, h - 1))
-        y_max = int(np.clip(y_max, y_min, h - 1))
-        ys = np.arange(y_min, y_max + 1, dtype=np.float64)
-        xs = np.polyval(coeffs, ys)
-        xs = np.clip(np.rint(xs), 0, w - 1).astype(np.int32)
-        pts = np.column_stack((xs, ys.astype(np.int32))).reshape(-1, 1, 2)
+        pts = path_points.copy()
+        pts[:, 0] = np.clip(np.rint(pts[:, 0]), 0, w - 1)
+        pts[:, 1] = np.clip(np.rint(pts[:, 1]), 0, h - 1)
+        
+        pts = pts.astype(np.int32).reshape(-1, 1, 2)
         cv2.polylines(overlay, [pts], isClosed=False, color=color, thickness=thickness)
 
     def draw_obstacle_boxes(self, overlay: np.ndarray, mask: np.ndarray, min_area: int = MIN_OBSTACLE_AREA_PX) -> None:
@@ -462,36 +457,23 @@ class LaneOverlayRenderer:
         camera_offset_x_px: float,
         roi_ratios: Tuple[float, float],
     ) -> np.ndarray:
-        """
-        Generate the full driving overlay image.
-        
-        This is the main entry point — it runs analysis and renders everything.
-        """
         h, w = mask.shape
 
         # Run analysis (reuses analyzer's internal logic)
-        yellow_fit, white_fit, center_coeffs, center_y_min, center_y_max, _, _ = analyzer.analyze(mask)
+        yellow_fit, white_fit, center_path, center_y_min, center_y_max, _, _ = analyzer.analyze(mask)
 
         # Compose overlay
         overlay = self.colorize(mask)
 
-        # Draw polynomial curves
+        # Draw path curves
         if yellow_fit is not None:
-            self.draw_polynomial(
-                overlay, yellow_fit.coeffs, self.curve_yellow, 2,
-                yellow_fit.y_min, yellow_fit.y_max
-            )
+            self.draw_path(overlay, yellow_fit.path_points, self.curve_yellow, 2)
         if white_fit is not None:
-            self.draw_polynomial(
-                overlay, white_fit.coeffs, self.curve_white, 2,
-                white_fit.y_min, white_fit.y_max
-            )
-        self.draw_polynomial(overlay, center_coeffs, self.curve_center, 3, center_y_min, center_y_max)
+            self.draw_path(overlay, white_fit.path_points, self.curve_white, 2)
+        self.draw_path(overlay, center_path, self.curve_center, 3)
 
-        # Draw obstacle boxes
+        # Draw obstacle boxes & ego axis
         self.draw_obstacle_boxes(overlay, mask)
-
-        # Draw ego axis
         ego_center = float(w / 2.0 + camera_offset_x_px)
         self.draw_ego_axis(overlay, ego_center)
 

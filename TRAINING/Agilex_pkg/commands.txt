@@ -1,17 +1,3 @@
-TERMINAL 1:
-source ~/limo_code_StutiRuparel/install/setup.bash
-ros2 launch limo_base limo_base.launch.py
-
-TERMINAL 2:
-source ~/limo_code_StutiRuparel/install/setup.bash
-ros2 launch orbbec_camera dabai_dcw2.launch.py
-
-TERMINAL 3:
-source ~/limo_code_StutiRuparel/install/setup.bash
-source ~/limo_code_StutiRuparel/src/install/setup.bash
-ros2 launch ydlidar_ros2_driver ydlidar_launch.py
-
-
 TERMINAL 1,2,3:
 ~/limo_code_StutiRuparel/limo_run.sh
 
@@ -39,7 +25,9 @@ python3 /home/agilex/limo_code_StutiRuparel/bev2/seg_bev_node.py \
 -p camera_params:=/home/agilex/limo_code_StutiRuparel/bev2/camera_params.txt \
 -p bev_size:=160 \
 -p mask_width:=160 \
--p mask_height:=120
+-p mask_height:=120 \
+
+-p calibrate_mode:=True         # For debugging purposes only 
 
 
 TERMINAL 6:
@@ -60,7 +48,11 @@ python3 /home/agilex/limo_code_StutiRuparel/bev2/autonomous_driving.py \
 
 
 
-EXTRA:
+## EXTRA:
+TERMINAL: (change bev src and dst points in real time)
+source ~/limo_code_StutiRuparel/install/setup.bash
+ros2 param set /seg_bev_node bev_src_top_left_x 65
+
 TERMINAL:
 source ~/limo_code_StutiRuparel/install/setup.bash
 python3 ~/limo_code_StutiRuparel/src/limo_camera_pkg/limo_camera_pkg/four_wheel_diff_controller_v3.py
@@ -72,3 +64,18 @@ python3 ~/limo_code_StutiRuparel/src/limo_camera_pkg/limo_camera_pkg/limo_teleop
     -p cmd_topic:=/cmd_vel \
     -p linear_speed:=0.15 \
     -p angular_speed:=0.4
+
+
+## FALLBACK:
+TERMINAL 1:
+source ~/limo_code_StutiRuparel/install/setup.bash
+ros2 launch limo_base limo_base.launch.py
+
+TERMINAL 2:
+source ~/limo_code_StutiRuparel/install/setup.bash
+ros2 launch orbbec_camera dabai_dcw2.launch.py
+
+TERMINAL 3:
+source ~/limo_code_StutiRuparel/install/setup.bash
+source ~/limo_code_StutiRuparel/src/install/setup.bash
+ros2 launch ydlidar_ros2_driver ydlidar_launch.py
