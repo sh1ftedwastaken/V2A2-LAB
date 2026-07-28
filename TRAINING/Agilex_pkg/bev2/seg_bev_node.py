@@ -48,6 +48,9 @@ from lane_analyzer import (
     STATE_LEFT_ONLY,
     STATE_RIGHT_ONLY,
     STATE_LOST,
+    DEFAULT_LANE_WIDTH_PX,
+    DEFAULT_ROI_START_RATIO,
+    DEFAULT_ROI_END_RATIO
 )  
 
 class SegBEVNode(Node):  
@@ -59,16 +62,16 @@ class SegBEVNode(Node):
         self.declare_parameter("bev_size", 160)
         self.declare_parameter("mask_width", 160)
         self.declare_parameter("mask_height", 120)
-        self.declare_parameter("default_lane_width", 100.0)
+        self.declare_parameter("default_lane_width", DEFAULT_LANE_WIDTH_PX)
         self.declare_parameter("camera_offset_x_px", 0.0)
-        self.declare_parameter("roi_start_ratio", 0.75)
-        self.declare_parameter("roi_end_ratio", 0.95)  
+        self.declare_parameter("roi_start_ratio", DEFAULT_ROI_START_RATIO)
+        self.declare_parameter("roi_end_ratio", DEFAULT_ROI_END_RATIO)
         self.declare_parameter("calibrate_mode", False)
         
         # BEV parameters
         # Bottom Edge Bounds (Y = 120)
         self.declare_parameter("bev_src_bottom_left_x", 15.0)
-        self.declare_parameter("bev_src_bottom_left_y", 120.0)  
+        self.declare_parameter("bev_src_bottom_left_y", 120.0)
 
         self.declare_parameter("bev_src_bottom_right_x", 150.0) 
         self.declare_parameter("bev_src_bottom_right_y", 120.0) 
@@ -81,18 +84,18 @@ class SegBEVNode(Node):
         self.declare_parameter("bev_src_top_right_y", 75.0)   
         
         # BEV destination points (square)
-        # Destination Bottom Edge (y = mask_height)
-        self.declare_parameter("bev_dst_bottom_left_x", 40.0)
-        self.declare_parameter("bev_dst_bottom_left_y", 160.0)
+        # Destination Bottom Edge
+        self.declare_parameter("bev_dst_bottom_left_x", 50.0)   
+        self.declare_parameter("bev_dst_bottom_left_y", 160.0)  
 
-        self.declare_parameter("bev_dst_bottom_right_x", 120.0)
+        self.declare_parameter("bev_dst_bottom_right_x", 110.0) 
         self.declare_parameter("bev_dst_bottom_right_y", 160.0)
 
-        # Destination Top Edge (y = 0)
-        self.declare_parameter("bev_dst_top_left_x", 40.0)
-        self.declare_parameter("bev_dst_top_left_y", 0.0)
+        # Destination Top Edge
+        self.declare_parameter("bev_dst_top_left_x", 50.0)      
+        self.declare_parameter("bev_dst_top_left_y", 0.0)  
 
-        self.declare_parameter("bev_dst_top_right_x", 120.0)
+        self.declare_parameter("bev_dst_top_right_x", 110.0)    
         self.declare_parameter("bev_dst_top_right_y", 0.0)
         
         # Parameters for lane analysis and overlay

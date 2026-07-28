@@ -36,7 +36,7 @@ STATE_PASSING = "PASSING"
 STATE_RETURNING = "RETURNING"
 
 DEFAULT_MAX_SPEED        = 0.20
-DEFAULT_CENTER_OFFSET_PX = 17.0
+DEFAULT_CENTER_OFFSET_PX = 0.0
 
 
 # =========================================================

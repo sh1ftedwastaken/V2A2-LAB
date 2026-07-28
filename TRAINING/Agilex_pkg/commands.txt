@@ -51,7 +51,7 @@ python3 /home/agilex/limo_code_StutiRuparel/bev2/autonomous_driving.py \
 ## EXTRA:
 TERMINAL: (change bev src and dst points in real time)
 source ~/limo_code_StutiRuparel/install/setup.bash
-ros2 param set /seg_bev_node bev_src_top_left_x 65
+ros2 param set /seg_bev_node bev_src_top_left_x 64
 
 TERMINAL:
 source ~/limo_code_StutiRuparel/install/setup.bash

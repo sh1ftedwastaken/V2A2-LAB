@@ -20,22 +20,22 @@ import numpy as np
 
 
 # =========================================================
-# CONSTANTS (shared across all nodes)
+# LANE OVERLAY RENDERER (stateless drawing)
 # =========================================================
 CLASS_BG = 0
 CLASS_ROAD = 1
 CLASS_WHITE = 2
 CLASS_YELLOW = 3
-CLASS_VEHICLE = 4
+CLASS_VEHICLE = 4  
 
-DEFAULT_LANE_WIDTH_PX = 100.0
+DEFAULT_LANE_WIDTH_PX = 60.0   # Changed from 100.0
 MIN_POLYFIT_POINTS = 30
 MIN_OBSTACLE_AREA_PX = 8
 LANE_FIT_BIN_HEIGHT_PX = 4
 MIN_LANE_FIT_BINS = 8
 CURVE_RMSE_IMPROVEMENT = 0.18
 CURVE_MIN_X_SPAN_PX = 12.0
-DEFAULT_ROI_START_RATIO = 0.75
+DEFAULT_ROI_START_RATIO = 0.70
 DEFAULT_ROI_END_RATIO = 0.95
 MIN_BOTH_LANE_GAP_PX = 35.0
 MAX_COMPONENT_ROI_DISTANCE_PX = 28.0
@@ -180,7 +180,14 @@ class LaneAnalyzer:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Extract points from the connected component closest to roi_x in the ROI."""
         class_mask = (mask == cls).astype(np.uint8)
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(class_mask, connectivity=8)
+        
+        # --- NEW: Morphological closing to bridge gaps in broken lines ---
+        # A 15x15 circular kernel will bridge gaps up to ~15 pixels wide
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        class_mask = cv2.morphologyEx(class_mask, cv2.MORPH_CLOSE, kernel)
+        # ---------------------------------------------------------------
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(class_mask, connectivity=8)  
 
         best_label = None
         best_distance = float("inf")
@@ -225,7 +232,7 @@ class LaneAnalyzer:
         if lane_y.size == 0:
             return None
         return self._fit_lane_poly(lane_y, lane_x, roi_x, count)
-
+    
     def _fit_lane_poly(
         self,
         y_points: np.ndarray,
@@ -233,49 +240,80 @@ class LaneAnalyzer:
         roi_x: float,
         count: int,
     ) -> Optional[LaneFit]:
-        if y_points.size <= MIN_POLYFIT_POINTS or np.unique(y_points).size < 3:
+        if y_points.size <= 30: # MIN_POLYFIT_POINTS
             return None
-        
-        fit_y, fit_x = self._binned_lane_points(y_points, x_points)
-        if fit_y.size < MIN_LANE_FIT_BINS:
+
+        # 1. Dynamic Axis Binning (Replaces Nearest Neighbor)
+        y_span = np.max(y_points) - np.min(y_points)
+        x_span = np.max(x_points) - np.min(x_points)
+        bin_size = 5
+
+        if y_span >= x_span:
+            # Mostly vertical: Bin by Y and average X
+            bins = y_points // bin_size
+            unique_bins = np.unique(bins)
+            sy = np.zeros(len(unique_bins))
+            sx = np.zeros(len(unique_bins))
+            for i, b in enumerate(unique_bins):
+                mask = (bins == b)
+                sy[i] = np.median(y_points[mask])
+                sx[i] = np.median(x_points[mask])
+            # Sort from the bottom of the screen (highest Y) upwards
+            order = np.argsort(sy)[::-1]
+        else:
+            # Mostly horizontal: Bin by X and average Y
+            bins = x_points // bin_size
+            unique_bins = np.unique(bins)
+            sx = np.zeros(len(unique_bins))
+            sy = np.zeros(len(unique_bins))
+            for i, b in enumerate(unique_bins):
+                mask = (bins == b)
+                sx[i] = np.median(x_points[mask])
+                sy[i] = np.median(y_points[mask])
+            # Find which end is closest to the car (highest Y) and start there
+            if sy[np.argmin(sx)] > sy[np.argmax(sx)]:
+                order = np.argsort(sx)       # Start left, sweep right
+            else:
+                order = np.argsort(sx)[::-1] # Start right, sweep left
+
+        sx = sx[order]
+        sy = sy[order]
+
+        if len(sx) < 3:
             return None
-            
-        # Parametric variable t (cumulative distance)
-        # Sort bottom to top (highest Y to lowest Y from robot's perspective)
-        order = np.argsort(fit_y)[::-1]
-        sy = fit_y[order]
-        sx = fit_x[order]
-        
+
+        # 2. Parametric Distance (t) calculation
         dt = np.sqrt(np.diff(sx)**2 + np.diff(sy)**2)
         t = np.zeros(len(sx))
         t[1:] = np.cumsum(dt)
         if t[-1] == 0:
             return None
         t_norm = t / t[-1]  # Normalize distance from 0.0 to 1.0
+
+        # 3. Fit X and Y independently based on distance t
+        degree_x = 2 if len(t_norm) > 3 else 1
+        degree_y = 1  # Force Y to be linear to prevent backward hooking  
         
-        # Fit X and Y independently based on distance t
-        degree = 2 if len(t_norm) > 3 else 1
-        coeffs_x = np.polyfit(t_norm, sx, degree)
-        coeffs_y = np.polyfit(t_norm, sy, degree)
-        
-        # Evaluate 50 discrete waypoints along the curve
-        t_eval = np.linspace(0.0, 1.0, 50)
+        coeffs_x = np.polyfit(t_norm, sx, degree_x)
+        coeffs_y = np.polyfit(t_norm, sy, degree_y)
+
+        # 4. Evaluate discrete waypoints along the extrapolated curve
+        # --- NEW: Expand evaluation from [0.0 to 1.0] to [-1.0 to 2.0] ---
+        # Increased to 150 points to maintain high resolution over the longer distance
+        t_eval = np.linspace(-1.0, 2.0, 150)
         path_x = np.polyval(coeffs_x, t_eval)
-        path_y = np.polyval(coeffs_y, t_eval)
+        path_y = np.polyval(coeffs_y, t_eval)  
         
         path_points = np.column_stack((path_x, path_y))
-        path_points[:, 0] += float(self.camera_offset_x_px)
-        
-        # Simple Euclidean RMSE against bins
-        rmse = 0.0 
+        path_points[:, 0] += float(self.camera_offset_x_px)  
         
         return LaneFit(
             path_points,
-            int(np.min(fit_y)),
-            int(np.max(fit_y)),
+            int(np.min(sy)),
+            int(np.max(sy)),
             float(roi_x),
             int(count),
-            rmse,
+            0.0,
         )
 
     # ---- Public API ----
@@ -335,17 +373,20 @@ class LaneAnalyzer:
                 center_y_max = max(yellow_fit.y_max, white_fit.y_max)
             state = STATE_BOTH
         elif yellow_fit is not None:
+            # Color-agnostic: Shift based on physical screen location
             offset = half_lane if yellow_fit.roi_x < ego_center else -half_lane
             center_path = self._shift_lane_path(yellow_fit, offset)
             center_y_min = yellow_fit.y_min
             center_y_max = yellow_fit.y_max
             state = STATE_LEFT_ONLY if yellow_fit.roi_x < ego_center else STATE_RIGHT_ONLY
+            
         elif white_fit is not None:
-            offset = -half_lane if white_fit.roi_x > ego_center else half_lane
+            # Color-agnostic: Shift based on physical screen location
+            offset = -half_lane if white_fit.roi_x >= ego_center else half_lane
             center_path = self._shift_lane_path(white_fit, offset)
             center_y_min = white_fit.y_min
             center_y_max = white_fit.y_max
-            state = STATE_RIGHT_ONLY if white_fit.roi_x > ego_center else STATE_LEFT_ONLY
+            state = STATE_RIGHT_ONLY if white_fit.roi_x >= ego_center else STATE_LEFT_ONLY   
 
         if state == STATE_RIGHT_ONLY:
             multiplier = -1.0
@@ -378,9 +419,28 @@ class LaneAnalyzer:
         return (left_fit.path_points + right_fit.path_points) / 2.0
 
     def _shift_lane_path(self, fit: LaneFit, offset_px: float) -> np.ndarray:
-        shifted = fit.path_points.copy()
-        shifted[:, 0] += offset_px
-        return shifted
+        pts = fit.path_points.copy()
+        if len(pts) < 2:
+            return pts
+        
+        # Calculate gradients (tangents) to find the direction of the curve
+        dx = np.gradient(pts[:, 0])
+        dy = np.gradient(pts[:, 1])
+        
+        # Calculate the length of the tangent vectors
+        lengths = np.sqrt(dx**2 + dy**2)
+        lengths[lengths == 0] = 1e-6  # Prevent division by zero
+        
+        # Calculate the right-pointing perpendicular normal vector.
+        # Since image Y increases downwards, the right normal is (-dy, dx)
+        nx = -dy / lengths
+        ny = dx / lengths
+        
+        # Shift the points along the perpendicular normal
+        pts[:, 0] += offset_px * nx
+        pts[:, 1] += offset_px * ny
+        
+        return pts
 
 
 # =========================================================
