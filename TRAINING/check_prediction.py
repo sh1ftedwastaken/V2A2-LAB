@@ -202,6 +202,7 @@ def main():
     samples = [load_sample(model, img_path, args.masks_dir, device) for img_path in img_paths]
 
     saved_paths = []
+    os.makedirs(os.path.dirname("predictions/"), exist_ok=True)
     for idx, sample in enumerate(samples, start=1):
         out_path = build_output_path(args.out, idx, len(img_paths))
         save_sample_figure(sample, out_path)

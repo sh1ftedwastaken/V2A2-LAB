@@ -31,7 +31,7 @@ for cls in range(5):
     count = (mask == cls).sum()
     pct   = count / total * 100
     bar   = "█" * int(pct / 2)
-    print(f"  {cls} {CLASS_NAMES[cls]:<15} {pct:5.1f}%  {bar}")
+    print(f"  {cls} {CLASS_NAMES[cls]:<15} {pct:5.3f}%  {bar}")
 
 print()
 print(f"Total masks converted: {len(files)}")

@@ -5,7 +5,7 @@ TERMINAL 4:
 source ~/limo_code_StutiRuparel/install/setup.bash
 python3 /home/agilex/limo_code_StutiRuparel/bev2/limo_segmentation_node.py \
 --ros-args \
--p checkpoint:=/home/agilex/limo_code_StutiRuparel/checkpoints/r_ce_jaccard9432.pth \
+-p checkpoint:=/home/agilex/limo_code_StutiRuparel/checkpoints/best_resnet34_unet_jaccard.pth \
 -p camera_topic:=/camera/color/image_raw \
 -p mask_topic:=/seg/mask \
 -p mask_raw_topic:=/seg/mask_raw \

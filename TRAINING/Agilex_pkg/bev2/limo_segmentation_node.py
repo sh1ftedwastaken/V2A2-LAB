@@ -112,7 +112,7 @@ class LimoSegmentationNode(Node):
         self.declare_parameter("overlay_alpha", 0.45)
 
         # Camera overlay parameters (new)
-        self.declare_parameter("camera_overlay_enabled", True)
+        self.declare_parameter("camera_overlay_enabled", False)
         self.declare_parameter("camera_roi_start_ratio", 0.75)
         self.declare_parameter("camera_roi_end_ratio", 0.95)
         self.declare_parameter("camera_lane_width_px", 100.0)

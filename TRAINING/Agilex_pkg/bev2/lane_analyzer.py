@@ -1,17 +1,26 @@
+#!/usr/bin/env python3
 """
 lane_analyzer.py
 ================
-Shared lane analysis and overlay rendering module.
 
-Extracted from seg_bev_node.py to eliminate duplication between:
-- seg_bev_node.py (BEV overlay)
-- autonomous_driving.py (lane tracking for control)
-- limo_segmentation_node.py (camera overlay)
+Shared lane analysis and overlay-rendering module.
 
-This module has ZERO ROS dependencies — pure numpy/OpenCV.
+This module has no ROS dependencies. It is used by:
+- seg_bev_node.py
+- autonomous_driving.py
+- limo_segmentation_node.py
+
+Important behavior
+------------------
+- Yellow and white are segmentation classes only.
+- Color does NOT determine whether a boundary is left or right.
+- Boundary side is determined from the fitted path's closest observed point.
+- Lane paths are represented as parametric [x, y] waypoints.
+- Single boundaries are shifted along their local perpendicular normals.
 """
 
 from __future__ import annotations
+
 import warnings
 from typing import NamedTuple, Optional, Tuple
 
@@ -20,25 +29,42 @@ import numpy as np
 
 
 # =========================================================
-# LANE OVERLAY RENDERER (stateless drawing)
+# SEGMENTATION CLASSES
 # =========================================================
+
 CLASS_BG = 0
 CLASS_ROAD = 1
 CLASS_WHITE = 2
 CLASS_YELLOW = 3
-CLASS_VEHICLE = 4  
+CLASS_VEHICLE = 4
 
-DEFAULT_LANE_WIDTH_PX = 60.0   # Changed from 100.0
+# =========================================================
+# LANE ANALYSIS DEFAULTS
+# =========================================================
+
+DEFAULT_LANE_WIDTH_PX = 55.0
+
 MIN_POLYFIT_POINTS = 30
 MIN_OBSTACLE_AREA_PX = 8
-LANE_FIT_BIN_HEIGHT_PX = 4
-MIN_LANE_FIT_BINS = 8
-CURVE_RMSE_IMPROVEMENT = 0.18
-CURVE_MIN_X_SPAN_PX = 12.0
+
 DEFAULT_ROI_START_RATIO = 0.70
 DEFAULT_ROI_END_RATIO = 0.95
+
 MIN_BOTH_LANE_GAP_PX = 35.0
 MAX_COMPONENT_ROI_DISTANCE_PX = 28.0
+
+LANE_BIN_SIZE_PX = 5
+MORPHOLOGY_KERNEL_SIZE = 15
+PATH_POINT_COUNT = 150
+
+# Keep the current extrapolation behavior. The observed line corresponds
+# approximately to t=[0, 1], while the extra range supports the blind spot.
+PATH_T_MIN = -1.0
+PATH_T_MAX = 2.0
+
+# =========================================================
+# POLYFIT ERROR HANDLING
+# =========================================================
 
 _RANK_WARNING_TYPES = tuple(
     warning_type
@@ -48,6 +74,7 @@ _RANK_WARNING_TYPES = tuple(
     )
     if warning_type is not None
 )
+
 _POLYFIT_ERRORS = (
     np.linalg.LinAlgError,
     ValueError,
@@ -55,48 +82,74 @@ _POLYFIT_ERRORS = (
     FloatingPointError,
 ) + _RANK_WARNING_TYPES
 
+
+# =========================================================
+# DRAWING COLORS
+# =========================================================
+
 CLASS_COLORS = {
-    CLASS_BG: (0, 255, 0),
-    CLASS_ROAD: (100, 100, 100),
-    CLASS_WHITE: (255, 255, 255),
-    CLASS_YELLOW: (0, 255, 255),
-    CLASS_VEHICLE: (0, 0, 255),
+    CLASS_BG:      (  0, 255,   0),
+    CLASS_ROAD:    (100, 100, 100),
+    CLASS_WHITE:   (255, 255, 255),
+    CLASS_YELLOW:  (  0, 255, 255),
+    CLASS_VEHICLE: (  0,   0, 255),
 }
 
-CURVE_YELLOW = (255, 0, 255)
-CURVE_WHITE = (255, 128, 0)
-CURVE_CENTER = (255, 0, 0)
-OBSTACLE_BOX = (0, 30, 255)
-EGO_AXIS = (255, 210, 40)
+CURVE_YELLOW = (255,   0, 255)
+CURVE_WHITE  = (255, 128,   0)
+CURVE_CENTER = (255,   0,   0)
+OBSTACLE_BOX = (  0,  30, 255)
+EGO_AXIS     = (255, 210,  40)
 
-STATE_BOTH = "BOTH_LANES"
-STATE_LEFT_ONLY = "LEFT_LANE_ONLY"
+
+# =========================================================
+# ANALYZER STATES
+# =========================================================
+
+STATE_BOTH       = "BOTH_LANES"
+STATE_LEFT_ONLY  = "LEFT_LANE_ONLY"
 STATE_RIGHT_ONLY = "RIGHT_LANE_ONLY"
-STATE_LOST = "LOST"
-STATE_DRIVABLE = "DRIVABLE_AREA_MODE"
+STATE_LOST       = "LOST"
+STATE_DRIVABLE   = "DRIVABLE_AREA_MODE"
 
 
 # =========================================================
 # DATA STRUCTURES
 # =========================================================
+
 class LaneFit(NamedTuple):
-    """Parametric lane path with metadata."""
-    path_points: np.ndarray     # N x 2 array of [x, y] coordinates
-    y_min: int                  # minimum y where fit is valid
-    y_max: int                  # maximum y where fit is valid
-    roi_x: float                # x position in ROI used for selection
-    count: int                  # number of pixels in fit
-    rmse: float                 # root mean square error of fit
+    """Parametric lane path and its measurement metadata."""
+
+    path_points: np.ndarray
+    y_min: int
+    y_max: int
+    roi_x: float
+    count: int
+    rmse: float
+
+
+class BoundaryCandidate(NamedTuple):
+    """A fitted physical boundary classified relative to the robot."""
+
+    color_name: str
+    fit: LaneFit
+    side: str
+    anchor_x: float
 
 
 # =========================================================
-# LANE ANALYZER (stateless fitting logic)
+# LANE ANALYZER
 # =========================================================
+
 class LaneAnalyzer:
     """
-    Stateless lane polynomial fitting.
-    
-    All configuration passed via __init__ — no hidden state between calls.
+    Shared parametric lane analyzer.
+
+    Yellow and white classes are fitted independently, but their colors are
+    not used to determine whether they are left or right boundaries.
+
+    Left/right classification is based on the fitted path's X coordinate at
+    the closest observed Y coordinate.
     """
 
     def __init__(
@@ -109,66 +162,53 @@ class LaneAnalyzer:
     ):
         self.lane_width_px = float(lane_width_px)
         self.camera_offset_x_px = float(camera_offset_x_px)
-        self.roi_start_ratio = float(roi_start_ratio)
-        self.roi_end_ratio = float(roi_end_ratio)
-        self.alpha_lane_width = float(alpha_lane_width)
+        self.roi_start_ratio = float(np.clip(roi_start_ratio, 0.0, 1.0))
+        self.roi_end_ratio = float(np.clip(roi_end_ratio, 0.0, 1.0))
 
-    # ---- Core fitting pipeline ----
+        if self.roi_end_ratio <= self.roi_start_ratio:
+            self.roi_end_ratio = min(1.0,self.roi_start_ratio + 0.05)
+
+        self.alpha_lane_width = float(np.clip(alpha_lane_width, 0.0, 1.0))
+
+    # -----------------------------------------------------
+    # ROI and measurements
+    # -----------------------------------------------------
 
     def roi_bounds(self, mask: np.ndarray) -> Tuple[int, int]:
-        """Return (y0, y1) pixel bounds of the ROI."""
-        h, _ = mask.shape
-        y0 = int(h * self.roi_start_ratio)
-        y1 = int(h * self.roi_end_ratio)
-        return max(0, y0), min(h, max(y0 + 1, y1))
+        """Return the vertical [y0, y1) bounds of the detection ROI."""
 
-    def lane_measurement(self, roi: np.ndarray, cls: int) -> Tuple[Optional[float], int]:
-        """Measure median x position of class in ROI. Returns (x, count) or (None, 0)."""
+        h, _ = mask.shape
+
+        y0 = int(round(h * self.roi_start_ratio))
+        y1 = int(round(h * self.roi_end_ratio))
+
+        y0 = max(0, min(h - 1, y0))
+        y1 = max(y0 + 1, min(h, y1))
+
+        return y0, y1
+
+    def lane_measurement(
+        self,
+        roi: np.ndarray,
+        cls: int,
+    ) -> Tuple[Optional[float], int]:
+        """
+        Measure the median X position of one segmentation class in the ROI.
+
+        Returns:
+            (median_x, pixel_count), or (None, 0) if insufficient evidence.
+        """
+
         _, xs = np.where(roi == cls)
+
         if xs.size < 12:
             return None, 0
+
         return float(np.median(xs)), int(xs.size)
 
-    def _polyfit_safe(self, y_points: np.ndarray, x_points: np.ndarray, degree: int) -> Optional[np.ndarray]:
-        """Safe polynomial fit with warning/error handling."""
-        if y_points.size <= degree or np.unique(y_points).size <= degree:
-            return None
-
-        try:
-            with warnings.catch_warnings():
-                for warning_type in _RANK_WARNING_TYPES:
-                    warnings.simplefilter("error", warning_type)
-                coeffs = np.polyfit(
-                    y_points.astype(np.float64),
-                    x_points.astype(np.float64),
-                    degree,
-                )
-        except _POLYFIT_ERRORS:
-            return None
-
-        if not np.all(np.isfinite(coeffs)):
-            return None
-        return coeffs
-
-    def _binned_lane_points(
-        self,
-        y_points: np.ndarray,
-        x_points: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Bin points by y and compute median x per bin."""
-        order = np.argsort(y_points)
-        y_sorted = y_points[order]
-        x_sorted = x_points[order].astype(np.float64)
-        bins = y_sorted // LANE_FIT_BIN_HEIGHT_PX
-        unique_bins, starts = np.unique(bins, return_index=True)
-
-        med_y = np.empty(unique_bins.size, dtype=np.float64)
-        med_x = np.empty(unique_bins.size, dtype=np.float64)
-        for i, start in enumerate(starts):
-            end = starts[i + 1] if i + 1 < starts.size else y_sorted.size
-            med_y[i] = np.median(y_sorted[start:end])
-            med_x[i] = np.median(x_sorted[start:end])
-        return med_y, med_x
+    # -----------------------------------------------------
+    # Connected-component extraction
+    # -----------------------------------------------------
 
     def _selected_component_points(
         self,
@@ -178,42 +218,77 @@ class LaneAnalyzer:
         y0: int,
         y1: int,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Extract points from the connected component closest to roi_x in the ROI."""
-        class_mask = (mask == cls).astype(np.uint8)
-        
-        # --- NEW: Morphological closing to bridge gaps in broken lines ---
-        # A 15x15 circular kernel will bridge gaps up to ~15 pixels wide
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-        class_mask = cv2.morphologyEx(class_mask, cv2.MORPH_CLOSE, kernel)
-        # ---------------------------------------------------------------
+        """
+        Extract the connected component nearest the measured ROI position.
 
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(class_mask, connectivity=8)  
+        Morphological closing bridges small segmentation gaps before connected
+        components are computed.
+        """
+
+        class_mask = (mask == cls).astype(np.uint8)
+
+        kernel_size = max(3, int(MORPHOLOGY_KERNEL_SIZE))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+        )
+
+        class_mask = cv2.morphologyEx(
+            class_mask, cv2.MORPH_CLOSE, kernel,
+        )
+
+        num_labels, labels, stats, _ = (
+            cv2.connectedComponentsWithStats(
+                class_mask, connectivity=8
+            )
+        )
 
         best_label = None
         best_distance = float("inf")
-        best_count = 0
+        best_roi_count = 0
+
+        roi_labels = labels[y0:y1, :]
 
         for label in range(1, num_labels):
-            if stats[label, cv2.CC_STAT_AREA] <= MIN_POLYFIT_POINTS:
+            component_area = int(stats[label, cv2.CC_STAT_AREA])
+
+            if component_area <= MIN_POLYFIT_POINTS:
                 continue
 
-            roi_labels = labels[y0:y1, :]
-            roi_ys, roi_xs = np.where(roi_labels == label)
+            _, roi_xs = np.where(roi_labels == label)
+
             if roi_xs.size < 12:
                 continue
 
-            distance = abs(float(np.median(roi_xs)) - roi_x)
+            component_roi_x = float(np.median(roi_xs))
+            distance = abs(component_roi_x - float(roi_x))
+
             if distance < best_distance:
                 best_distance = distance
-                best_count = int(roi_xs.size)
+                best_roi_count = int(roi_xs.size)
                 best_label = label
 
-        if best_label is None or best_distance > MAX_COMPONENT_ROI_DISTANCE_PX:
-            return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+        if best_label is None:
+            return (
+                np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+            )
+
+        if best_distance > MAX_COMPONENT_ROI_DISTANCE_PX:
+            return (
+                np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+            )
 
         ys, xs = np.where(labels == best_label)
-        if ys.size < max(MIN_POLYFIT_POINTS, best_count):
-            return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+
+        minimum_count = max(MIN_POLYFIT_POINTS, best_roi_count)
+
+        if ys.size < minimum_count:
+            return (
+                np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+            )
+
         return ys, xs
 
     def _fit_selected_lane(
@@ -225,14 +300,24 @@ class LaneAnalyzer:
         y0: int,
         y1: int,
     ) -> Optional[LaneFit]:
+        """Extract and fit the selected component for one class."""
+
         if roi_x is None:
             return None
 
-        lane_y, lane_x = self._selected_component_points(mask, cls, roi_x, y0, y1)
+        lane_y, lane_x = self._selected_component_points(
+            mask, cls, roi_x, y0, y1
+        )
+
         if lane_y.size == 0:
             return None
+
         return self._fit_lane_poly(lane_y, lane_x, roi_x, count)
-    
+
+    # -----------------------------------------------------
+    # Parametric path fitting
+    # -----------------------------------------------------
+
     def _fit_lane_poly(
         self,
         y_points: np.ndarray,
@@ -240,41 +325,65 @@ class LaneAnalyzer:
         roi_x: float,
         count: int,
     ) -> Optional[LaneFit]:
-        if y_points.size <= 30: # MIN_POLYFIT_POINTS
+        """
+        Fit a parametric lane path x(t), y(t).
+
+        Dynamic-axis binning is used:
+        - Mostly vertical components are binned by Y.
+        - Mostly horizontal components are binned by X.
+
+        The resulting center points are ordered from the end closest to the
+        robot toward the farther end.
+        """
+
+        if y_points.size <= MIN_POLYFIT_POINTS:
             return None
 
-        # 1. Dynamic Axis Binning (Replaces Nearest Neighbor)
-        y_span = np.max(y_points) - np.min(y_points)
-        x_span = np.max(x_points) - np.min(x_points)
-        bin_size = 5
+        y_points = y_points.astype(np.float64)
+        x_points = x_points.astype(np.float64)
+
+        y_span = float(np.max(y_points) - np.min(y_points))
+        x_span = float(np.max(x_points) - np.min(x_points))
+
+        bin_size = max(1, int(LANE_BIN_SIZE_PX))
 
         if y_span >= x_span:
-            # Mostly vertical: Bin by Y and average X
-            bins = y_points // bin_size
+            # Mostly vertical path: bin by Y and compute median X.
+            bins = (y_points // bin_size).astype(np.int64)
             unique_bins = np.unique(bins)
-            sy = np.zeros(len(unique_bins))
-            sx = np.zeros(len(unique_bins))
-            for i, b in enumerate(unique_bins):
-                mask = (bins == b)
-                sy[i] = np.median(y_points[mask])
-                sx[i] = np.median(x_points[mask])
-            # Sort from the bottom of the screen (highest Y) upwards
+
+            sy = np.zeros(len(unique_bins), dtype=np.float64)
+            sx = np.zeros(len(unique_bins), dtype=np.float64)
+
+            for i, bin_id in enumerate(unique_bins):
+                selected = bins == bin_id
+                sy[i] = np.median(y_points[selected])
+                sx[i] = np.median(x_points[selected])
+
+            # Image Y increases downward. Start at the closest end.
             order = np.argsort(sy)[::-1]
+
         else:
-            # Mostly horizontal: Bin by X and average Y
-            bins = x_points // bin_size
+            # Mostly horizontal path: bin by X and compute median Y.
+            bins = (x_points // bin_size).astype(np.int64)
             unique_bins = np.unique(bins)
-            sx = np.zeros(len(unique_bins))
-            sy = np.zeros(len(unique_bins))
-            for i, b in enumerate(unique_bins):
-                mask = (bins == b)
-                sx[i] = np.median(x_points[mask])
-                sy[i] = np.median(y_points[mask])
-            # Find which end is closest to the car (highest Y) and start there
-            if sy[np.argmin(sx)] > sy[np.argmax(sx)]:
-                order = np.argsort(sx)       # Start left, sweep right
+
+            sx = np.zeros(len(unique_bins), dtype=np.float64)
+            sy = np.zeros(len(unique_bins), dtype=np.float64)
+
+            for i, bin_id in enumerate(unique_bins):
+                selected = bins == bin_id
+                sx[i] = np.median(x_points[selected])
+                sy[i] = np.median(y_points[selected])
+
+            left_index = int(np.argmin(sx))
+            right_index = int(np.argmax(sx))
+
+            # Begin from whichever horizontal end is closer to the car.
+            if sy[left_index] > sy[right_index]:
+                order = np.argsort(sx)
             else:
-                order = np.argsort(sx)[::-1] # Start right, sweep left
+                order = np.argsort(sx)[::-1]
 
         sx = sx[order]
         sy = sy[order]
@@ -282,176 +391,489 @@ class LaneAnalyzer:
         if len(sx) < 3:
             return None
 
-        # 2. Parametric Distance (t) calculation
-        dt = np.sqrt(np.diff(sx)**2 + np.diff(sy)**2)
-        t = np.zeros(len(sx))
-        t[1:] = np.cumsum(dt)
-        if t[-1] == 0:
-            return None
-        t_norm = t / t[-1]  # Normalize distance from 0.0 to 1.0
-
-        # 3. Fit X and Y independently based on distance t
-        degree_x = 2 if len(t_norm) > 3 else 1
-        degree_y = 1  # Force Y to be linear to prevent backward hooking  
-        
-        coeffs_x = np.polyfit(t_norm, sx, degree_x)
-        coeffs_y = np.polyfit(t_norm, sy, degree_y)
-
-        # 4. Evaluate discrete waypoints along the extrapolated curve
-        # --- NEW: Expand evaluation from [0.0 to 1.0] to [-1.0 to 2.0] ---
-        # Increased to 150 points to maintain high resolution over the longer distance
-        t_eval = np.linspace(-1.0, 2.0, 150)
-        path_x = np.polyval(coeffs_x, t_eval)
-        path_y = np.polyval(coeffs_y, t_eval)  
-        
-        path_points = np.column_stack((path_x, path_y))
-        path_points[:, 0] += float(self.camera_offset_x_px)  
-        
-        return LaneFit(
-            path_points,
-            int(np.min(sy)),
-            int(np.max(sy)),
-            float(roi_x),
-            int(count),
-            0.0,
+        segment_lengths = np.hypot(
+            np.diff(sx),
+            np.diff(sy),
         )
 
-    # ---- Public API ----
+        # Remove exact duplicate consecutive points.
+        keep = np.ones(len(sx), dtype=bool)
+        keep[1:] = segment_lengths > 1e-6
 
-    def analyze(self, mask: np.ndarray) -> Tuple[Optional[LaneFit], Optional[LaneFit], Optional[np.ndarray], int, int, str]:
+        sx = sx[keep]
+        sy = sy[keep]
+
+        if len(sx) < 3:
+            return None
+
+        segment_lengths = np.hypot(
+            np.diff(sx),
+            np.diff(sy),
+        )
+
+        t = np.zeros(len(sx), dtype=np.float64)
+        t[1:] = np.cumsum(segment_lengths)
+
+        if t[-1] <= 1e-6:
+            return None
+
+        t_norm = t / t[-1]
+
+        degree_x = 2 if len(t_norm) > 3 else 1
+
+        # Keep Y monotonic to prevent backward hooks that can flip normals.
+        degree_y = 1
+
+        try:
+            with warnings.catch_warnings():
+                for warning_type in _RANK_WARNING_TYPES:
+                    warnings.simplefilter("error", warning_type)
+
+                coeffs_x = np.polyfit(t_norm, sx, degree_x)
+                coeffs_y = np.polyfit(t_norm, sy, degree_y)
+
+        except _POLYFIT_ERRORS:
+            return None
+
+        if not (
+            np.all(np.isfinite(coeffs_x)) and np.all(np.isfinite(coeffs_y))
+        ):
+            return None
+
+        t_eval = np.linspace(PATH_T_MIN, PATH_T_MAX, PATH_POINT_COUNT)
+
+        path_x = np.polyval(coeffs_x, t_eval)
+        path_y = np.polyval(coeffs_y, t_eval)
+
+        path_points = np.column_stack((path_x, path_y)).astype(np.float64)
+
+        path_points[:, 0] += float(self.camera_offset_x_px)
+
+        if not np.isfinite(path_points).all():
+            return None
+
+        # Compute a simple parametric fit error over the observed points.
+        predicted_x = np.polyval(coeffs_x, t_norm)
+        predicted_y = np.polyval(coeffs_y, t_norm)
+
+        rmse = float(
+            np.sqrt(np.mean((predicted_x - sx) ** 2 + (predicted_y - sy) ** 2))
+        )
+
+        return LaneFit(
+            path_points=path_points,
+            y_min=int(np.floor(np.min(sy))),
+            y_max=int(np.ceil(np.max(sy))),
+            roi_x=float(roi_x),
+            count=int(count),
+            rmse=rmse,
+        )
+
+    # -----------------------------------------------------
+    # Bottom-anchor boundary classification
+    # -----------------------------------------------------
+
+    def _bottom_anchor_x(self, fit: LaneFit) -> float:
         """
-        Full lane analysis on a mask.
-        
+        Return the path X coordinate at the closest observed line position.
+
+        The fitted path is extrapolated beyond the observed component. Using
+        argmax(path_y) directly could select an artificial extrapolated point.
+
+        Therefore, this method finds the path point closest to fit.y_max,
+        which is the bottom of the actual observed component.
+        """
+
+        points = fit.path_points
+
+        if points is None or len(points) == 0:
+            return float(fit.roi_x)
+
+        finite = np.isfinite(points).all(axis=1)
+
+        if not np.any(finite):
+            return float(fit.roi_x)
+
+        valid_points = points[finite]
+
+        index = int(
+            np.argmin(np.abs(valid_points[:, 1] - float(fit.y_max)))
+        )
+
+        return float(valid_points[index, 0])
+
+    def _make_boundary_candidate(
+        self,
+        color_name: str,
+        fit: LaneFit,
+        ego_center: float,
+    ) -> BoundaryCandidate:
+        """
+        Convert a color fit into a physical left/right boundary candidate.
+        """
+
+        anchor_x = self._bottom_anchor_x(fit)
+
+        side = ("left" if anchor_x < ego_center else "right")
+
+        return BoundaryCandidate(
+            color_name=color_name,
+            fit=fit,
+            side=side,
+            anchor_x=anchor_x,
+        )
+
+    @staticmethod
+    def _candidate_strength(
+        candidate: BoundaryCandidate,
+    ) -> Tuple[int, float]:
+        """
+        Rank candidates using component evidence.
+
+        More pixels are preferred. If counts match, lower RMSE is preferred.
+        """
+
+        return (int(candidate.fit.count), -float(candidate.fit.rmse))
+
+    # -----------------------------------------------------
+    # Path geometry
+    # -----------------------------------------------------
+
+    def _average_lane_paths(
+        self,
+        left_fit: LaneFit,
+        right_fit: LaneFit,
+    ) -> np.ndarray:
+        """
+        Average aligned parametric waypoints from opposite boundaries.
+        """
+
+        left_points = left_fit.path_points
+        right_points = right_fit.path_points
+
+        point_count = min(len(left_points), len(right_points)) 
+        if point_count == 0:
+            return np.empty((0, 2), dtype=np.float64)
+
+        return (left_points[:point_count] + right_points[:point_count]) / 2.0
+
+    def _shift_lane_path(
+        self,
+        fit: LaneFit,
+        offset_px: float,
+    ) -> np.ndarray:
+        """
+        Shift a boundary along its local perpendicular normal.
+
+        Positive offset shifts toward image-right for a bottom-to-top path.
+        Negative offset shifts toward image-left.
+        """
+
+        points = fit.path_points.copy()
+
+        if len(points) < 2:
+            return points
+
+        dx = np.gradient(points[:, 0])
+        dy = np.gradient(points[:, 1])
+
+        lengths = np.hypot(dx, dy)
+        lengths = np.maximum(lengths, 1e-6)
+
+        # In image coordinates, Y increases downward. For a path ordered
+        # from near to far, (-dy, dx) is its right-facing normal.
+        normal_x = -dy / lengths
+        normal_y = dx / lengths
+
+        points[:, 0] += float(offset_px) * normal_x
+        points[:, 1] += float(offset_px) * normal_y
+
+        return points
+
+    def update_lane_width(
+        self,
+        measured_width: float,
+    ) -> None:
+        """Update lane width using an exponential moving average."""
+
+        if not np.isfinite(measured_width):
+            return
+
+        if measured_width < MIN_BOTH_LANE_GAP_PX:
+            return
+
+        self.lane_width_px = (
+            self.alpha_lane_width * float(measured_width)
+            + (1.0 - self.alpha_lane_width)
+            * float(self.lane_width_px)
+        )
+
+    # -----------------------------------------------------
+    # Public API
+    # -----------------------------------------------------
+
+    def analyze(
+        self,
+        mask: np.ndarray,
+    ) -> Tuple[
+        Optional[LaneFit],
+        Optional[LaneFit],
+        Optional[np.ndarray],
+        int,
+        int,
+        str,
+        float,
+    ]:
+        """
+        Analyze a segmentation mask.
+
         Returns:
-            yellow_fit, white_fit, center_coeffs, center_y_min, center_y_max, state
+            yellow_fit,
+            white_fit,
+            center_path,
+            center_y_min,
+            center_y_max,
+            state,
+            multiplier
+
+        Yellow/white are retained in the return value for visualization.
+        Centerline generation itself is based on physical left/right boundary
+        classification, not color.
         """
+
+        if mask is None or mask.ndim != 2:
+            return (None, None, None, 0, 0,STATE_LOST, 1.0)
+
         h, w = mask.shape
         y0, y1 = self.roi_bounds(mask)
         roi = mask[y0:y1, :]
+
         ego_center = float(w / 2.0)
         half_lane = float(self.lane_width_px) / 2.0
-        obstacle_mask = (mask == CLASS_VEHICLE).astype(np.uint8)
 
-        # 1. ROI measurement (mirrors EdgeLaneTracker)
-        yellow_x, yellow_count = self.lane_measurement(roi, CLASS_YELLOW)
-        white_x, white_count = self.lane_measurement(roi, CLASS_WHITE)
+        # -------------------------------------------------
+        # 1. Measure yellow and white evidence in the ROI.
+        # -------------------------------------------------
+
+        yellow_x, yellow_count = self.lane_measurement(
+            roi, CLASS_YELLOW,
+        )
+        white_x, white_count = self.lane_measurement(
+            roi, CLASS_WHITE,
+        )
 
         use_yellow = yellow_x is not None
         use_white = white_x is not None
 
+        # If yellow and white measurements are too close, they probably
+        # describe the same physical line with mixed segmentation colors.
         if use_yellow and use_white:
-            measured_width = abs(float(white_x) - float(yellow_x))
-            if measured_width >= MIN_BOTH_LANE_GAP_PX:
-                self.update_lane_width(measured_width)
-                half_lane = float(self.lane_width_px) / 2.0
-            elif yellow_count >= white_count:
-                use_white = False
-            else:
-                use_yellow = False
+            measured_gap = abs(float(white_x) - float(yellow_x))
 
-        # 2. Fit selected lane components
+            if measured_gap < MIN_BOTH_LANE_GAP_PX:
+                # Keep only the stronger physical component.
+                if yellow_count >= white_count:
+                    use_white = False
+                else:
+                    use_yellow = False
+
+        # -------------------------------------------------
+        # 2. Fit selected color components.
+        # -------------------------------------------------
+
         yellow_fit = self._fit_selected_lane(
-            mask, CLASS_YELLOW, yellow_x if use_yellow else None, yellow_count, y0, y1
-        )
-        white_fit = self._fit_selected_lane(
-            mask, CLASS_WHITE, white_x if use_white else None, white_count, y0, y1
+            mask,
+            CLASS_YELLOW,
+            yellow_x if use_yellow else None,
+            yellow_count,
+            y0,
+            y1,
         )
 
-        # 3. Unified centerline solver
+        white_fit = self._fit_selected_lane(
+            mask,
+            CLASS_WHITE,
+            white_x if use_white else None,
+            white_count,
+            y0,
+            y1,
+        )
+
+        # -------------------------------------------------
+        # 3. Convert color fits into physical boundaries.
+        # -------------------------------------------------
+
+        candidates = []
+
+        if yellow_fit is not None:
+            candidates.append(
+                self._make_boundary_candidate(
+                    "yellow", yellow_fit, ego_center,
+                )
+            )
+
+        if white_fit is not None:
+            candidates.append(
+                self._make_boundary_candidate(
+                    "white", white_fit, ego_center
+                )
+            )
+
+        left_candidates = [
+            candidate for candidate in candidates if candidate.side == "left"
+        ]
+
+        right_candidates = [
+            candidate for candidate in candidates if candidate.side == "right" ############################## RESUME FROM HERE
+        ]
+
+        # -------------------------------------------------
+        # 4. Solve the centerline using left/right geometry.
+        # -------------------------------------------------
+
         center_path = None
         center_y_min = y0
         center_y_max = y1 - 1
         state = STATE_LOST
         multiplier = 1.0
 
-        if yellow_fit is not None and white_fit is not None:
-            center_path = self._average_lane_paths(yellow_fit, white_fit)
-            center_y_min = max(yellow_fit.y_min, white_fit.y_min)
-            center_y_max = min(yellow_fit.y_max, white_fit.y_max)
-            if center_y_min > center_y_max:
-                center_y_min = min(yellow_fit.y_min, white_fit.y_min)
-                center_y_max = max(yellow_fit.y_max, white_fit.y_max)
-            state = STATE_BOTH
-        elif yellow_fit is not None:
-            # Color-agnostic: Shift based on physical screen location
-            offset = half_lane if yellow_fit.roi_x < ego_center else -half_lane
-            center_path = self._shift_lane_path(yellow_fit, offset)
-            center_y_min = yellow_fit.y_min
-            center_y_max = yellow_fit.y_max
-            state = STATE_LEFT_ONLY if yellow_fit.roi_x < ego_center else STATE_RIGHT_ONLY
-            
-        elif white_fit is not None:
-            # Color-agnostic: Shift based on physical screen location
-            offset = -half_lane if white_fit.roi_x >= ego_center else half_lane
-            center_path = self._shift_lane_path(white_fit, offset)
-            center_y_min = white_fit.y_min
-            center_y_max = white_fit.y_max
-            state = STATE_RIGHT_ONLY if white_fit.roi_x >= ego_center else STATE_LEFT_ONLY   
+        if left_candidates and right_candidates:
+            # With the current two-color pipeline, normally only one
+            # candidate exists per side. These selectors remain safe if
+            # additional candidates are introduced later.
+            left_candidate = max(
+                left_candidates,
+                key=self._candidate_strength,
+            )
 
-        if state == STATE_RIGHT_ONLY:
-            multiplier = -1.0
+            right_candidate = max(
+                right_candidates,
+                key=self._candidate_strength,
+            )
 
-        # 4. Fallback to drivable area if completely lost
+            anchor_gap = (
+                right_candidate.anchor_x
+                - left_candidate.anchor_x
+            )
+
+            if anchor_gap >= MIN_BOTH_LANE_GAP_PX:
+                left_fit = left_candidate.fit
+                right_fit = right_candidate.fit
+
+                center_path = self._average_lane_paths(
+                    left_fit,
+                    right_fit,
+                )
+
+                center_y_min = max(
+                    left_fit.y_min,
+                    right_fit.y_min,
+                )
+                center_y_max = min(
+                    left_fit.y_max,
+                    right_fit.y_max,
+                )
+
+                if center_y_min > center_y_max:
+                    center_y_min = min(
+                        left_fit.y_min,
+                        right_fit.y_min,
+                    )
+                    center_y_max = max(
+                        left_fit.y_max,
+                        right_fit.y_max,
+                    )
+
+                # Update width only from boundaries that physically
+                # bracket the robot.
+                self.update_lane_width(anchor_gap)
+
+                state = STATE_BOTH
+                multiplier = 1.0
+
+        if center_path is None and candidates:
+            # This covers:
+            # - only one visible physical boundary,
+            # - two color fits classified on the same side,
+            # - two opposite candidates whose gap is implausibly small.
+            #
+            # Keep the strongest/cleanest candidate. Color is irrelevant.
+            selected = max(
+                candidates,
+                key=self._candidate_strength,
+            )
+
+            selected_fit = selected.fit
+
+            if selected.side == "left":
+                # Shift the left boundary right into its lane.
+                center_path = self._shift_lane_path(
+                    selected_fit,
+                    +half_lane,
+                )
+                state = STATE_LEFT_ONLY
+                multiplier = 1.0
+
+            else:
+                # Shift the right boundary left into its lane.
+                center_path = self._shift_lane_path(
+                    selected_fit,
+                    -half_lane,
+                )
+                state = STATE_RIGHT_ONLY
+                multiplier = -1.0
+
+            center_y_min = selected_fit.y_min
+            center_y_max = selected_fit.y_max
+
+        # -------------------------------------------------
+        # 5. Conservative drivable-area fallback.
+        # -------------------------------------------------
+
         if center_path is None:
-            _, xs = np.where(roi == CLASS_ROAD)
-            if len(xs) > 50:
-                med_x = float(np.median(xs))
-                # Create a vertical straight path
-                center_path = np.column_stack((
-                    np.full(50, med_x),
-                    np.linspace(center_y_max, center_y_min, 50)
-                ))
+            road_ys, road_xs = np.where(
+                roi == CLASS_ROAD
+            )
+
+            if road_xs.size > 50:
+                median_x = float(np.median(road_xs))
+
+                center_path = np.column_stack(
+                    (
+                        np.full(
+                            50,
+                            median_x,
+                            dtype=np.float64,
+                        ),
+                        np.linspace(
+                            center_y_max,
+                            center_y_min,
+                            50,
+                            dtype=np.float64,
+                        ),
+                    )
+                )
+
                 state = STATE_DRIVABLE
+                multiplier = 1.0
 
-        return yellow_fit, white_fit, center_path, center_y_min, center_y_max, state, multiplier
-
-    def update_lane_width(self, measured_width: float) -> None:
-        """EMA update of running lane width."""
-        self.lane_width_px = (
-            self.alpha_lane_width * measured_width
-            + (1.0 - self.alpha_lane_width) * float(self.lane_width_px)
+        return (
+            yellow_fit,
+            white_fit,
+            center_path,
+            center_y_min,
+            center_y_max,
+            state,
+            multiplier,
         )
 
-    # ---- Helpers ----
-
-    def _average_lane_paths(self, left_fit: LaneFit, right_fit: LaneFit) -> np.ndarray:
-        # Averages the 50 aligned waypoints (t_eval points match 1:1)
-        return (left_fit.path_points + right_fit.path_points) / 2.0
-
-    def _shift_lane_path(self, fit: LaneFit, offset_px: float) -> np.ndarray:
-        pts = fit.path_points.copy()
-        if len(pts) < 2:
-            return pts
-        
-        # Calculate gradients (tangents) to find the direction of the curve
-        dx = np.gradient(pts[:, 0])
-        dy = np.gradient(pts[:, 1])
-        
-        # Calculate the length of the tangent vectors
-        lengths = np.sqrt(dx**2 + dy**2)
-        lengths[lengths == 0] = 1e-6  # Prevent division by zero
-        
-        # Calculate the right-pointing perpendicular normal vector.
-        # Since image Y increases downwards, the right normal is (-dy, dx)
-        nx = -dy / lengths
-        ny = dx / lengths
-        
-        # Shift the points along the perpendicular normal
-        pts[:, 0] += offset_px * nx
-        pts[:, 1] += offset_px * ny
-        
-        return pts
-
 
 # =========================================================
-# LANE OVERLAY RENDERER (stateless drawing)
+# LANE OVERLAY RENDERER
 # =========================================================
+
 class LaneOverlayRenderer:
-    """
-    Stateless overlay drawing.
-    
-    All colors and style constants passed via __init__ or use module-level defaults.
-    """
+    """Stateless renderer for lane-analysis debugging."""
 
     def __init__(
         self,
@@ -467,11 +889,20 @@ class LaneOverlayRenderer:
         self.obstacle_box = obstacle_box
         self.ego_axis = ego_axis
 
-    def colorize(self, mask: np.ndarray) -> np.ndarray:
-        """Convert single-channel class mask to BGR color image."""
-        color = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
+    def colorize(
+        self,
+        mask: np.ndarray,
+    ) -> np.ndarray:
+        """Convert a class mask into a BGR image."""
+
+        color = np.zeros(
+            (mask.shape[0], mask.shape[1], 3),
+            dtype=np.uint8,
+        )
+
         for cls, bgr in CLASS_COLORS.items():
             color[mask == cls] = bgr
+
         return color
 
     def draw_path(
@@ -481,33 +912,114 @@ class LaneOverlayRenderer:
         color: Tuple[int, int, int],
         thickness: int,
     ) -> None:
-        """Draw parametric path on overlay."""
-        if path_points is None or len(path_points) == 0:
+        """
+        Draw a parametric path.
+
+        Points are not clipped directly to the image borders. Direct clipping
+        can turn an off-screen curve into artificial horizontal or vertical
+        lines along the image edge. OpenCV clips line segments during drawing.
+        """
+
+        if path_points is None or len(path_points) < 2:
             return
-        
-        h, w = overlay.shape[:2]
-        pts = path_points.copy()
-        pts[:, 0] = np.clip(np.rint(pts[:, 0]), 0, w - 1)
-        pts[:, 1] = np.clip(np.rint(pts[:, 1]), 0, h - 1)
-        
-        pts = pts.astype(np.int32).reshape(-1, 1, 2)
-        cv2.polylines(overlay, [pts], isClosed=False, color=color, thickness=thickness)
 
-    def draw_obstacle_boxes(self, overlay: np.ndarray, mask: np.ndarray, min_area: int = MIN_OBSTACLE_AREA_PX) -> None:
-        """Draw bounding boxes around vehicle-class obstacles."""
-        obstacle_mask = (mask == CLASS_VEHICLE).astype(np.uint8)
-        contours, _ = cv2.findContours(obstacle_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            if cv2.contourArea(cnt) >= min_area:
-                x, y, bw, bh = cv2.boundingRect(cnt)
-                cv2.rectangle(overlay, (x, y), (x + bw, y + bh), self.obstacle_box, 2)
+        points = np.asarray(
+            path_points,
+            dtype=np.float64,
+        )
 
-    def draw_ego_axis(self, overlay: np.ndarray, ego_center_x: float) -> None:
-        """Draw dotted vertical ego center line."""
+        finite = np.isfinite(points).all(axis=1)
+        points = points[finite]
+
+        if len(points) < 2:
+            return
+
         h, w = overlay.shape[:2]
-        ego_center = int(np.clip(round(ego_center_x), 0, w - 1))
-        for y_dot in range(0, h, 6):
-            cv2.circle(overlay, (ego_center, y_dot), 1, self.ego_axis, -1)
+
+        # Prevent unsafe integer conversion for pathological values while
+        # keeping the safety limits well outside the visible frame.
+        points[:, 0] = np.clip(
+            points[:, 0],
+            -4.0 * w,
+            5.0 * w,
+        )
+        points[:, 1] = np.clip(
+            points[:, 1],
+            -4.0 * h,
+            5.0 * h,
+        )
+
+        points = np.rint(points).astype(np.int32)
+        points = points.reshape(-1, 1, 2)
+
+        cv2.polylines(
+            overlay,
+            [points],
+            isClosed=False,
+            color=color,
+            thickness=thickness,
+            lineType=cv2.LINE_AA,
+        )
+
+    def draw_obstacle_boxes(
+        self,
+        overlay: np.ndarray,
+        mask: np.ndarray,
+        min_area: int = MIN_OBSTACLE_AREA_PX,
+    ) -> None:
+        """Draw bounding boxes around vehicle-class components."""
+
+        obstacle_mask = (
+            mask == CLASS_VEHICLE
+        ).astype(np.uint8)
+
+        contours, _ = cv2.findContours(
+            obstacle_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+
+        for contour in contours:
+            if cv2.contourArea(contour) < min_area:
+                continue
+
+            x, y, width, height = cv2.boundingRect(
+                contour
+            )
+
+            cv2.rectangle(
+                overlay,
+                (x, y),
+                (x + width, y + height),
+                self.obstacle_box,
+                2,
+            )
+
+    def draw_ego_axis(
+        self,
+        overlay: np.ndarray,
+        ego_center_x: float,
+    ) -> None:
+        """Draw the dotted robot-center axis."""
+
+        h, w = overlay.shape[:2]
+
+        ego_center = int(
+            np.clip(
+                round(ego_center_x),
+                0,
+                w - 1,
+            )
+        )
+
+        for y in range(0, h, 6):
+            cv2.circle(
+                overlay,
+                (ego_center, y),
+                1,
+                self.ego_axis,
+                -1,
+            )
 
     def driving_overlay(
         self,
@@ -517,24 +1029,62 @@ class LaneOverlayRenderer:
         camera_offset_x_px: float,
         roi_ratios: Tuple[float, float],
     ) -> np.ndarray:
-        h, w = mask.shape
+        """
+        Run lane analysis and draw the detected paths.
 
-        # Run analysis (reuses analyzer's internal logic)
-        yellow_fit, white_fit, center_path, center_y_min, center_y_max, _, _ = analyzer.analyze(mask)
+        lane_width_px and roi_ratios remain in this method signature for
+        compatibility with the existing callers.
+        """
 
-        # Compose overlay
+        _, w = mask.shape
+
+        (
+            yellow_fit,
+            white_fit,
+            center_path,
+            _,
+            _,
+            _,
+            _,
+        ) = analyzer.analyze(mask)
+
         overlay = self.colorize(mask)
 
-        # Draw path curves
         if yellow_fit is not None:
-            self.draw_path(overlay, yellow_fit.path_points, self.curve_yellow, 2)
-        if white_fit is not None:
-            self.draw_path(overlay, white_fit.path_points, self.curve_white, 2)
-        self.draw_path(overlay, center_path, self.curve_center, 3)
+            self.draw_path(
+                overlay,
+                yellow_fit.path_points,
+                self.curve_yellow,
+                2,
+            )
 
-        # Draw obstacle boxes & ego axis
-        self.draw_obstacle_boxes(overlay, mask)
-        ego_center = float(w / 2.0 + camera_offset_x_px)
-        self.draw_ego_axis(overlay, ego_center)
+        if white_fit is not None:
+            self.draw_path(
+                overlay,
+                white_fit.path_points,
+                self.curve_white,
+                2,
+            )
+
+        self.draw_path(
+            overlay,
+            center_path,
+            self.curve_center,
+            3,
+        )
+
+        self.draw_obstacle_boxes(
+            overlay,
+            mask,
+        )
+
+        ego_center = float(
+            w / 2.0 + camera_offset_x_px
+        )
+
+        self.draw_ego_axis(
+            overlay,
+            ego_center,
+        )
 
         return overlay

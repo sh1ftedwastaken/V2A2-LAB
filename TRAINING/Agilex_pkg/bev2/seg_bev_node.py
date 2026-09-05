@@ -68,46 +68,31 @@ class SegBEVNode(Node):
         self.declare_parameter("roi_end_ratio", DEFAULT_ROI_END_RATIO)
         self.declare_parameter("calibrate_mode", False)
         
-        # BEV parameters
-        # Bottom Edge Bounds (Y = 120)
-        self.declare_parameter("bev_src_bottom_left_x", 15.0)
-        self.declare_parameter("bev_src_bottom_left_y", 120.0)
-
-        self.declare_parameter("bev_src_bottom_right_x", 150.0) 
-        self.declare_parameter("bev_src_bottom_right_y", 120.0) 
+        # BEV Source Parameters
+        self.declare_parameter("bev_src_bottom_left_x", 8.0)
+        self.declare_parameter("bev_src_bottom_left_y", 118.0)  
+        self.declare_parameter("bev_src_bottom_right_x", 152.0) 
+        self.declare_parameter("bev_src_bottom_right_y", 118.0) 
+        self.declare_parameter("bev_src_top_right_x", 120.0)    
+        self.declare_parameter("bev_src_top_right_y", 80.0)   
+        self.declare_parameter("bev_src_top_left_x", 30.0)  
+        self.declare_parameter("bev_src_top_left_y", 80.0)    
         
-        # Top Edge Bounds (Y = 75)
-        self.declare_parameter("bev_src_top_left_x", 64.0)  
-        self.declare_parameter("bev_src_top_left_y", 75.0)     
-
-        self.declare_parameter("bev_src_top_right_x", 99.0)    
-        self.declare_parameter("bev_src_top_right_y", 75.0)   
-        
-        # BEV destination points (square)
-        # Destination Bottom Edge
-        self.declare_parameter("bev_dst_bottom_left_x", 50.0)   
-        self.declare_parameter("bev_dst_bottom_left_y", 160.0)  
-
-        self.declare_parameter("bev_dst_bottom_right_x", 110.0) 
-        self.declare_parameter("bev_dst_bottom_right_y", 160.0)
-
-        # Destination Top Edge
-        self.declare_parameter("bev_dst_top_left_x", 50.0)      
-        self.declare_parameter("bev_dst_top_left_y", 0.0)  
-
-        self.declare_parameter("bev_dst_top_right_x", 110.0)    
-        self.declare_parameter("bev_dst_top_right_y", 0.0)
+        # BEV Destination Parameters (Margin-based)
+        self.declare_parameter("bev_dst_margin_x", 20.0)
+        self.declare_parameter("bev_dst_top_y", 5.0)
+        self.declare_parameter("bev_dst_bottom_y", 155.0)
         
         # Parameters for lane analysis and overlay
-        self.bev_size      = self.get_parameter("bev_size").value
-        self.mask_w        = self.get_parameter("mask_width").value
-        self.mask_h        = self.get_parameter("mask_height").value
-        mask_topic         = self.get_parameter("mask_topic").value
-        params_path        = self.get_parameter("camera_params").value
+        self.bev_size           = self.get_parameter("bev_size").value
+        self.mask_w             = self.get_parameter("mask_width").value
+        self.mask_h             = self.get_parameter("mask_height").value
+        mask_topic              = self.get_parameter("mask_topic").value
+        params_path             = self.get_parameter("camera_params").value
         self.camera_offset_x_px = self.get_parameter("camera_offset_x_px").value
         self.lane_width_px      = self.get_parameter("default_lane_width").value
         self.roi_start_ratio    = self.get_parameter("roi_start_ratio").value
-        self.roi_end_ratio      = self.get_parameter("roi_end_ratio").value  
+        self.roi_end_ratio      = self.get_parameter("roi_end_ratio").value   
         
         with open(params_path, "r", encoding="utf-8") as handle:
             cam = yaml.safe_load(handle)  
@@ -147,19 +132,19 @@ class SegBEVNode(Node):
     def _get_src_points(self) -> np.ndarray:
         """Fetches live ROS parameters for source points."""
         return np.float32([
-            [self.get_parameter("bev_src_top_left_x").value,     self.get_parameter("bev_src_top_left_y").value],
-            [self.get_parameter("bev_src_top_right_x").value,    self.get_parameter("bev_src_top_right_y").value],
+            [self.get_parameter("bev_src_bottom_left_x").value,  self.get_parameter("bev_src_bottom_left_y").value],
             [self.get_parameter("bev_src_bottom_right_x").value, self.get_parameter("bev_src_bottom_right_y").value],
-            [self.get_parameter("bev_src_bottom_left_x").value,  self.get_parameter("bev_src_bottom_left_y").value]
+            [self.get_parameter("bev_src_top_right_x").value,    self.get_parameter("bev_src_top_right_y").value],
+            [self.get_parameter("bev_src_top_left_x").value,     self.get_parameter("bev_src_top_left_y").value],
         ])
         
     def _get_dst_points(self) -> np.ndarray:
         """Fetches live ROS parameters for destination points."""
         return np.float32([
-            [self.get_parameter("bev_dst_top_left_x").value,     self.get_parameter("bev_dst_top_left_y").value],
-            [self.get_parameter("bev_dst_top_right_x").value,    self.get_parameter("bev_dst_top_right_y").value],
-            [self.get_parameter("bev_dst_bottom_right_x").value, self.get_parameter("bev_dst_bottom_right_y").value],
-            [self.get_parameter("bev_dst_bottom_left_x").value,  self.get_parameter("bev_dst_bottom_left_y").value]
+            [self.get_parameter("bev_dst_margin_x").value,                 self.get_parameter("bev_dst_bottom_y").value],
+            [self.bev_size - self.get_parameter("bev_dst_margin_x").value, self.get_parameter("bev_dst_bottom_y").value],
+            [self.bev_size - self.get_parameter("bev_dst_margin_x").value, self.get_parameter("bev_dst_top_y").value],
+            [self.get_parameter("bev_dst_margin_x").value,                 self.get_parameter("bev_dst_top_y").value],
         ])
 
     def colorize(self, mask: np.ndarray) -> np.ndarray:

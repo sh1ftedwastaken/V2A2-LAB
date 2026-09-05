@@ -2,8 +2,8 @@
 LightUNet Training Script
 ==========================
 Run from your project folder:
-    python train2.py                              # default: combo loss, 300 epochs
-    python train2.py --loss ce_jaccard            # BEST so far (0.9274 mIoU)
+    python train2.py                              
+    python train2.py --loss ce_jaccard
     python train2.py --loss ce_jaccard --epochs 400
     python train2.py --loss combo --epochs 300
     python train2.py --loss unet3p_hybrid --epochs 150
@@ -12,7 +12,7 @@ Run from your project folder:
 Expects:
     data/images/       raw camera photos (.png or .jpg)
     data/masks_single/ single-channel masks (.png) — run convert_masks.py first!
-
+    
 Classes:
     0  background
     1  road
@@ -31,8 +31,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, random_split, ConcatDataset
 from torchvision import transforms
+
 
 from loss_functions import BCEDiceLoss, JaccardLoss, LogCoshDiceLoss, LovaszSoftmaxLoss, UNet3PlusHybridLoss
 
@@ -547,7 +548,7 @@ def parse_args():
     p.add_argument("--dropout_p",   type=float, default=0.3)
     p.add_argument("--loss",        default="ce_jaccard",
                    choices=LOSS_CHOICES)
-    p.add_argument("--model",       default="lightunet",
+    p.add_argument("--model",       default="resnet34_unet",
                    choices=MODEL_CHOICES)
     p.add_argument("--encoder_weights", default="imagenet",
                    choices=["imagenet", "none"],
@@ -576,31 +577,58 @@ def main():
     print(f"[device]  {device}")
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Dataset
-    full_ds   = SegDataset(args.images_dir, args.masks_dir, augment=False)
-    n_val     = max(1, int(len(full_ds) * args.val_split))
-    n_train   = len(full_ds) - n_val
-    train_idx, val_idx = random_split(
-        range(len(full_ds)), [n_train, n_val],
+    old_full_ds = SegDataset("./data_old/images", "./data_old/masks_single", augment=False)
+    n_val_old   = max(1, int(len(old_full_ds) * args.val_split))
+    n_train_old = len(old_full_ds) - n_val_old
+    train_idx_old, val_idx_old = random_split(
+        range(len(old_full_ds)), [n_train_old, n_val_old],
         generator=torch.Generator().manual_seed(42)
     )
-    train_idx = list(train_idx)
-    val_idx   = list(val_idx)
 
-    train_ds = SegDataset(args.images_dir, args.masks_dir, augment=True)
-    val_ds   = SegDataset(args.images_dir, args.masks_dir, augment=False)
+    new_full_ds = SegDataset("./data/images", "./data/masks_single", augment=False)
+    n_val_new   = max(1, int(len(new_full_ds) * args.val_split))
+    n_train_new = len(new_full_ds) - n_val_new
+    train_idx_new, val_idx_new = random_split(
+        range(len(new_full_ds)), [n_train_new, n_val_new],
+        generator=torch.Generator().manual_seed(42)
+    )
+
+    train_old_ds = SegDataset("./data_old/images", "./data_old/masks_single", augment=True)
+    val_old_ds   = SegDataset("./data_old/images", "./data_old/masks_single", augment=False)
+    
+    train_new_ds = SegDataset("./data/images", "./data/masks_single", augment=True)
+    val_new_ds   = SegDataset("./data/images", "./data/masks_single", augment=False)
+
+    train_old_sub = torch.utils.data.Subset(train_old_ds, list(train_idx_old))
+    val_old_sub   = torch.utils.data.Subset(val_old_ds, list(val_idx_old))
+    
+    train_new_sub = torch.utils.data.Subset(train_new_ds, list(train_idx_new))
+    val_new_sub   = torch.utils.data.Subset(val_new_ds, list(val_idx_new))
+
+    # Multiply by 9 to balance ~80 new images with ~700 old images
+    oversample_multiplier = 9
+    oversampled_train_new = torch.utils.data.ConcatDataset([train_new_sub] * oversample_multiplier)
+    
+    total_original_train = len(train_idx_old) + len(train_idx_new)
+    oversampled_images_added = len(train_idx_new) * (oversample_multiplier - 1)
+
+    final_train_ds = torch.utils.data.ConcatDataset([train_old_sub, oversampled_train_new])
+    final_val_ds   = torch.utils.data.ConcatDataset([val_old_sub, val_new_sub])
 
     train_loader = DataLoader(
-        torch.utils.data.Subset(train_ds, train_idx),
+        final_train_ds,
         batch_size=args.batch_size, shuffle=True,
         num_workers=0, pin_memory=True
     )
     val_loader = DataLoader(
-        torch.utils.data.Subset(val_ds, val_idx),
+        final_val_ds,
         batch_size=args.batch_size, shuffle=False,
         num_workers=0, pin_memory=True
     )
-    print(f"[data]    train={len(train_idx)}  val={len(val_idx)}")
+    
+    print(f"[data]    Total training images used = {len(final_train_ds)} (Val = {len(final_val_ds)})")
+    print(f"[data]    -- Unique training images: {total_original_train}")
+    print(f"[data]    -- Oversampled images added: {oversampled_images_added} ({oversample_multiplier}x multiplier on {len(train_idx_new)} new images)")
     print(f"[save]    best={os.path.basename(best_path)}  last={os.path.basename(last_path)}")
 
     # Model

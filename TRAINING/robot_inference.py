@@ -7,8 +7,8 @@ Outputs for each input image:
 - an overlay of labels on top of the raw image (.png)
 
 Examples:
-    py robot_inference.py --input data_test/images/frame.png
-    py robot_inference.py --input data_test/images --weights checkpoints/best_resnet34_unet_ce_jaccard.pth
+    python robot_inference.py --input data_test/images/frame.png
+    python robot_inference.py --input data_test/images --weights checkpoints/best_resnet34_unet_ce_jaccard.pth
 """
 
 import argparse

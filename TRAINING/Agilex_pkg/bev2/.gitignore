@@ -1,3 +1,5 @@
 .codegraph
 .omo
 **/__pycache__/**
+./data/**
+./data_old/**
