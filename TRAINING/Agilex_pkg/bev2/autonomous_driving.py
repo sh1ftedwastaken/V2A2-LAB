@@ -56,7 +56,7 @@ STATE_RETURNING = "RETURNING"
 # =========================================================
 
 DEFAULT_MAX_SPEED = 0.25
-DEFAULT_CENTER_OFFSET_PX = 35.0
+DEFAULT_CENTER_OFFSET_PX = 30
 
 # Fixed controller target. For a 160-pixel BEV:
 # 0.82 * 159 ~= 130 pixels.
@@ -115,7 +115,7 @@ class Controller:
         self,
         kp: float = 0.015,
         kd: float = 0.005,
-        max_angular: float = 0.45,
+        max_angular: float = 0.43,
     ):
         self.kp = float(kp)
         self.kd = float(kd)
@@ -422,7 +422,7 @@ class Driver(Node):
         actual_mid_pt = center_path[len(center_path) // 2]
         straight_mid_pt = (center_path[0] + center_path[-1]) / 2.0
         bow_distance = np.linalg.norm(actual_mid_pt - straight_mid_pt)
-        is_straight = bow_distance < 4.0 
+        is_straight = bow_distance < 4.5
 
         if state == STATE_BOTH or is_straight:
             desired_center = width / 2.0

@@ -63,7 +63,7 @@ class SegBEVNode(Node):
         self.declare_parameter("mask_width", 160)
         self.declare_parameter("mask_height", 120)
         self.declare_parameter("default_lane_width", DEFAULT_LANE_WIDTH_PX)
-        self.declare_parameter("camera_offset_x_px", 0.0)
+        self.declare_parameter("camera_offset_x_px", 5.0)
         self.declare_parameter("roi_start_ratio", DEFAULT_ROI_START_RATIO)
         self.declare_parameter("roi_end_ratio", DEFAULT_ROI_END_RATIO)
         self.declare_parameter("calibrate_mode", False)

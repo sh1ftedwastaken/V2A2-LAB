@@ -650,6 +650,8 @@ class LaneAnalyzer:
 
         ego_center = float(w / 2.0)
         half_lane = float(self.lane_width_px) / 2.0
+        single_line_half_lane = half_lane * 0.87
+
 
         # -------------------------------------------------
         # 1. Measure yellow and white evidence in the ROI.
@@ -809,7 +811,7 @@ class LaneAnalyzer:
                 # Shift the left boundary right into its lane.
                 center_path = self._shift_lane_path(
                     selected_fit,
-                    +half_lane,
+                    +single_line_half_lane,
                 )
                 state = STATE_LEFT_ONLY
                 multiplier = 1.0
@@ -818,7 +820,7 @@ class LaneAnalyzer:
                 # Shift the right boundary left into its lane.
                 center_path = self._shift_lane_path(
                     selected_fit,
-                    -half_lane,
+                    -single_line_half_lane,
                 )
                 state = STATE_RIGHT_ONLY
                 multiplier = -1.0
@@ -856,6 +858,22 @@ class LaneAnalyzer:
 
                 state = STATE_DRIVABLE
                 multiplier = 1.0
+        
+        # -------------------------------------------------
+        # 6. Prevent path from extrapolating beyond visible road
+        # -------------------------------------------------
+        if center_path is not None and len(center_path) > 0:
+            # Instead of checking mask color, we mathematically cut off the 
+            # path so it doesn't extend higher than the furthest observed lane point.
+            # (Note: In image coordinates, a smaller Y means higher up the screen)
+            valid_idx = center_path[:, 1] >= (center_y_min - 10) 
+            
+            # Keep only the valid points
+            center_path = center_path[valid_idx]
+            
+            # If the path is too short, mark it as lost
+            if len(center_path) < 2:
+                center_path = None
 
         return (
             yellow_fit,
